@@ -341,16 +341,20 @@ struct HiddenPlan {
     std::vector<std::wstring> restore;  // yedeği var, hedefte değil: geri yükle
 };
 
-// target: gizlenmesi istenen CLSID'ler; backups: yedek listesi.
+// target: gizlenmesi istenen CLSID'ler; backups: yedek listesi. anyUnresolved:
+// çözülemeyen bir gizli kural var. Böyle bir kuralın CLSID'i hedefte yoktur ve
+// yedeği geri yüklenmeye aday görünür; bu yüzden o turda hiçbir şey geri
+// yüklenmez (gizleme ve doğrulama sürer).
 inline HiddenPlan PlanHidden(const std::vector<std::wstring>& target,
-                             const std::vector<std::wstring>& backups) {
+                             const std::vector<std::wstring>& backups,
+                             bool anyUnresolved = false) {
     HiddenPlan plan;
     for (const std::wstring& clsid : target) {
         (ContainsClsid(backups, clsid) ? plan.ensure : plan.hide)
             .push_back(clsid);
     }
     for (const std::wstring& clsid : backups) {
-        if (!ContainsClsid(target, clsid)) {
+        if (!anyUnresolved && !ContainsClsid(target, clsid)) {
             plan.restore.push_back(clsid);
         }
     }
@@ -360,11 +364,16 @@ inline HiddenPlan PlanHidden(const std::vector<std::wstring>& target,
 // hidden: true olan kuralların CLSID'leri (normalleştirilmiş, tekilleştirilmiş,
 // kural sırasıyla). CLSID kuralları doğrudan, isim kuralları resolveName ile
 // (std::wstring(std::wstring_view); çözülemezse boş ya da CLSID olmayan döner)
-// CLSID'e çevrilir; çözülemeyenler atlanır.
+// CLSID'e çevrilir; çözülemeyenler atlanır ve *unresolved (verilmişse) true
+// olur, aksi halde false. Boş match'li ve gizli olmayan kurallar sayılmaz.
 template <typename ResolveName>
 std::vector<std::wstring> ComputeHiddenTargets(
     const std::vector<NavRule>& rules,
-    ResolveName&& resolveName) {
+    ResolveName&& resolveName,
+    bool* unresolved = nullptr) {
+    if (unresolved) {
+        *unresolved = false;
+    }
     std::vector<std::wstring> targets;
     for (const NavRule& rule : rules) {
         if (!rule.hidden || rule.match.empty()) {
@@ -373,6 +382,12 @@ std::vector<std::wstring> ComputeHiddenTargets(
         std::wstring clsid = IsClsidString(rule.match)
                                  ? rule.match
                                  : std::wstring(resolveName(rule.match));
+        if (!IsClsidString(clsid)) {
+            if (unresolved) {
+                *unresolved = true;
+            }
+            continue;
+        }
         AddToBackupList(targets, clsid);
     }
     return targets;
@@ -821,17 +836,31 @@ void NotifyShellChanged() {
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
 }
 
+// Son ApplyHidden turunda çözülemeyen bir gizli isim kuralı kaldıysa true.
+// RetryClsidResolution bunu görünce (en fazla kResolveRetryMs'de bir) ApplyHidden'ı
+// yeniden çalıştırır.
+std::atomic<bool> g_hiddenUnresolved{false};
+
 // Ayarlardaki hidden: true kurallarını registry'ye uygular, kaldırılanları
-// geri yükler. Tekrar çağrılması zararsızdır (idempotent).
+// geri yükler. Tekrar çağrılması zararsızdır (idempotent). Çözülemeyen bir
+// gizli isim kuralı varsa o turda geri yükleme yapılmaz (kuralın yedeği geri
+// yüklenip öğe görünür kalmasın) ve yeniden deneme istenir.
 void ApplyHidden() {
     std::lock_guard<std::mutex> lock(g_hiddenMutex);
     ComScope com;  // isim kuralları için kabuk çağrıları
     auto config = GetConfig();
 
+    bool unresolved = false;
     std::vector<std::wstring> target = ComputeHiddenTargets(
         config->settings.navItems,
-        [](std::wstring_view name) { return FindClsidByName(name); });
-    HiddenPlan plan = PlanHidden(target, LoadBackupList());
+        [](std::wstring_view name) { return FindClsidByName(name); },
+        &unresolved);
+    g_hiddenUnresolved.store(unresolved);
+    if (unresolved) {
+        Wh_Log(L"ApplyHidden: unresolved hidden name rule(s); restore "
+               L"skipped, will retry");
+    }
+    HiddenPlan plan = PlanHidden(target, LoadBackupList(), unresolved);
 
     bool changed = false;
     for (const std::wstring& clsid : plan.hide) {
@@ -1366,13 +1395,17 @@ void PostReapplyToAllTrees() {
 }
 
 // Mevcut Config'te çözülemeyen CLSID kuralı varsa (ör. Phone Link isim alanı
-// Explorer açılışında henüz hazır değildi) çözümü yeniden dener. Süreç
-// genelinde en fazla kResolveRetryMs'de bir dener; süre dolmamışsa kalan süre
-// için bu ağaçta bir zamanlayıcı kurar. Ağacın (STA) UI thread'inde çağrılır.
-// Kabuk çağrıları hiçbir kilit tutulmadan yapılır.
+// Explorer açılışında henüz hazır değildi) çözümü yeniden dener; çözülemeyen
+// gizli isim kuralı varsa (g_hiddenUnresolved) ApplyHidden'ı yeniden çalıştırır.
+// Süreç genelinde en fazla kResolveRetryMs'de bir dener; süre dolmamışsa kalan
+// süre için bu ağaçta bir zamanlayıcı kurar. Ağacın (STA) UI thread'inde
+// çağrılır. Kabuk çağrıları hiçbir kilit tutulmadan yapılır (ApplyHidden yalnızca
+// kendi kısa süreli g_hiddenMutex'ini alır ve hiçbir pencere işlemi yapmaz).
 void RetryClsidResolution(HWND tree) {
     auto base = GetConfig();
-    if (!HasUnresolvedClsid(base->settings.navItems, base->effectiveMatch)) {
+    bool hiddenPending = g_hiddenUnresolved.load();
+    if (!hiddenPending &&
+        !HasUnresolvedClsid(base->settings.navItems, base->effectiveMatch)) {
         return;
     }
 
@@ -1386,6 +1419,13 @@ void RetryClsidResolution(HWND tree) {
     // Aynı anda başka bir thread de denemek isteyebilir; yalnızca biri kazanır.
     if (!g_lastResolveAttempt.compare_exchange_strong(last, now)) {
         return;
+    }
+
+    // Gizli isim kuralı çözülemiyordu; şimdi çözülürse gizlenir ve (bekleyen)
+    // geri yüklemeler de yapılır. Sonuç bayrağı ApplyHidden günceller; çözülene
+    // kadar bir sonraki tetiklemede yine denenir.
+    if (hiddenPending) {
+        ApplyHidden();
     }
 
     std::vector<std::wstring> match = base->effectiveMatch;

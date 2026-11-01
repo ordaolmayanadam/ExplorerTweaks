@@ -277,6 +277,18 @@ static void test_plan_hidden() {
     // İkisi de boş: iş yok.
     p = PlanHidden(none, none);
     CHECK(p.hide.empty() && p.ensure.empty() && p.restore.empty());
+
+    // Çözülemeyen gizli kural varsa geri yükleme yapılmaz (yedek o kurala ait
+    // olabilir); gizleme ve doğrulama sürer.
+    p = PlanHidden(target, backups, true);
+    CHECK(p.hide.size() == 1 && p.hide[0] == kHome);
+    CHECK(p.ensure.size() == 1 && p.ensure[0] == kGallery);
+    CHECK(p.restore.empty());
+    p = PlanHidden(none, both, true);
+    CHECK(p.hide.empty() && p.ensure.empty() && p.restore.empty());
+    // Bayrak yokken davranış değişmez.
+    p = PlanHidden(none, both, false);
+    CHECK(p.restore == both);
 }
 
 static void test_hidden_targets() {
@@ -302,6 +314,27 @@ static void test_hidden_targets() {
     CHECK(ComputeHiddenTargets({}, resolve).empty());
     // Gizli kural yoksa boş.
     CHECK(ComputeHiddenTargets({{L"Gallery", L"", false}}, resolve).empty());
+
+    // Çözülemeyen gizli isim kuralı unresolved bayrağını kaldırır.
+    bool unresolved = false;
+    t = ComputeHiddenTargets(rules, resolve, &unresolved);
+    CHECK(t.size() == 2);
+    CHECK(unresolved);  // "Nonexistent"
+    unresolved = true;  // çağıranın değeri değil, sonuç yazılır
+    std::vector<NavRule> ok = {{L"Gallery", L"", true}, {kHome, L"", true}};
+    t = ComputeHiddenTargets(ok, resolve, &unresolved);
+    CHECK(t.size() == 2 && !unresolved);
+    // Gizli olmayan çözülemez kural, boş match ve CLSID kuralları sayılmaz.
+    std::vector<NavRule> noise = {{L"Nonexistent", L"", false},
+                                  {L"", L"x", true},
+                                  {kHome, L"", true}};
+    ComputeHiddenTargets(noise, resolve, &unresolved);
+    CHECK(!unresolved);
+    // Çözücü CLSID olmayan bir şey dönerse de çözülemedi sayılır.
+    auto junk = [](std::wstring_view) { return std::wstring(L"junk"); };
+    t = ComputeHiddenTargets(std::vector<NavRule>{{L"Gallery", L"", true}},
+                             junk, &unresolved);
+    CHECK(t.empty() && unresolved);
 }
 
 int main() {
