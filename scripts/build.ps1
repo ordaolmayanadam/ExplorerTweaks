@@ -23,7 +23,10 @@ try {
         $libs = '-lcomctl32', '-lole32', '-loleaut32', '-lshlwapi', '-lruntimeobject'
         $clangArgs = @($flags) + @('-I', (Join-Path $compiler 'include'),
             '-shared', '-O2', '-o', 'build\explorer-tweaks.dll', 'explorer-tweaks.wh.cpp',
-            '-L', $engine, '-lwindhawk') + $libs
+            '-L', $engine, '-lwindhawk',
+            # Windhawk'ın kendi derleme komutuyla aynı: DllGetClassObject (XAML TAP)
+            # gibi otomatik dışa aktarımdan dışlanan semboller de dışa aktarılır.
+            '-Wl,--export-all-symbols') + $libs
         & $clang @clangArgs
         if ($LASTEXITCODE -ne 0) { Write-Host 'mod build FAILED'; exit 1 }
         Write-Host 'mod build OK: build\explorer-tweaks.dll'

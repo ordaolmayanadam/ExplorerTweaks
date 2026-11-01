@@ -398,18 +398,36 @@ std::vector<std::wstring> ComputeHiddenTargets(
 #ifndef ET_LOGIC_ONLY
 
 #include <commctrl.h>
+#include <ocidl.h>
 #include <shlobj.h>
+#include <unknwn.h>
+#include <xamlom.h>
 #define STRSAFE_NO_DEPRECATE
 #include <strsafe.h>
 #include <windhawk_utils.h>
+
+// windows.h'deki GetCurrentTime makrosu C++/WinRT XAML başlıklarıyla çakışır.
+#undef GetCurrentTime
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Microsoft.UI.Dispatching.h>
+#include <winrt/Microsoft.UI.Xaml.h>
+#include <winrt/Microsoft.UI.Xaml.Controls.h>
+#include <winrt/Microsoft.UI.Xaml.Data.h>
+#include <winrt/Microsoft.UI.Xaml.Media.h>
 
 #include <atomic>
 #include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
+
+// Wh_ModBeforeUninit'te true olur. Bundan sonra kancalar hiçbir şey eklemez ve
+// davranışı değiştirmez (doğrudan orijinale geçer), yeni XAML işi başlamaz.
+std::atomic<bool> g_unloading{false};
 
 // ===== Settings =====
 
@@ -891,7 +909,8 @@ void RestoreAllHidden() {
 
 // ===== Run on window thread =====
 
-UINT g_runMsg = RegisterWindowMessageW(L"ExplorerTweaks_Run");
+// Wh_ModInit'te kaydedilir (global dinamik başlatıcı yerine).
+UINT g_runMsg = 0;
 
 constexpr UINT kRunTimeoutMs = 2000;
 
@@ -921,28 +940,29 @@ LRESULT CALLBACK RunCallWndProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 // fn'i hwnd'nin thread'inde senkron olarak çalıştırır. Çağıran hiçbir kilit
-// tutmamalıdır: fn hedef thread'de aynı kilitleri alabilir.
-void RunOnWindowThread(HWND hwnd, std::function<void()> fn) {
+// tutmamalıdır: fn hedef thread'de aynı kilitleri alabilir. fn çalıştıysa true;
+// zaman aşımı ya da hata durumunda false (fn o zaman hiç çalışmaz).
+bool RunOnWindowThread(HWND hwnd, std::function<void()> fn) {
     DWORD pid = 0;
     DWORD threadId = GetWindowThreadProcessId(hwnd, &pid);
     if (!threadId) {
         Wh_Log(L"RunOnWindowThread: invalid window %p", hwnd);
-        return;
+        return false;
     }
     // Tutamaç yok edilip başka bir süreçte yeniden kullanılmış olabilir; hook
     // o sürece kurulmamalı.
     if (pid != GetCurrentProcessId()) {
         Wh_Log(L"RunOnWindowThread: window %p belongs to another process",
                hwnd);
-        return;
+        return false;
     }
     if (threadId == GetCurrentThreadId()) {
         fn();
-        return;
+        return true;
     }
     if (!g_runMsg) {
         Wh_Log(L"RunOnWindowThread: message not registered");
-        return;
+        return false;
     }
 
     HHOOK hook = SetWindowsHookExW(WH_CALLWNDPROC, RunCallWndProc, nullptr,
@@ -950,7 +970,7 @@ void RunOnWindowThread(HWND hwnd, std::function<void()> fn) {
     if (!hook) {
         Wh_Log(L"RunOnWindowThread: SetWindowsHookExW failed (%u)",
                GetLastError());
-        return;
+        return false;
     }
 
     auto* req = new RunRequest;
@@ -975,7 +995,7 @@ void RunOnWindowThread(HWND hwnd, std::function<void()> fn) {
             Wh_Log(L"RunOnWindowThread: SendMessageTimeout failed for %p (%u)",
                    hwnd, sendError);
         }
-        return;
+        return false;
     }
 
     // fn çalıştı ya da (zaman aşımına denk geldiyse) hâlâ çalışıyor. fn
@@ -984,6 +1004,7 @@ void RunOnWindowThread(HWND hwnd, std::function<void()> fn) {
         Sleep(1);
     }
     delete req;
+    return true;
 }
 
 // ===== Nav tree =====
@@ -994,7 +1015,8 @@ constexpr UINT_PTR kRetryTimerId = 0xE9;  // ertelenmiş CLSID yeniden denemesi
 constexpr UINT kResortDelayMs = 50;
 
 // Ağaca gönderilir (PostMessage): adları yeniden uygula ve yeniden sırala.
-UINT g_reapplyMsg = RegisterWindowMessageW(L"ExplorerTweaks_Reapply");
+// Wh_ModInit'te kaydedilir.
+UINT g_reapplyMsg = 0;
 
 std::mutex g_treesMutex;
 std::unordered_set<HWND> g_trees;
@@ -1694,6 +1716,845 @@ void ForEachNavTree(void (*fn)(HWND)) {
     }
 }
 
+// ===== XAML (tabs and command bar) =====
+// Explorer'ın üst bölümü (tablar, adres satırı, toolbar) bir WinUI 3 (Windows
+// App SDK) XAML island'ıdır: CabinetWClass >
+// Microsoft.UI.Content.DesktopChildSiteBridge. Elemanlara XAML Diagnostics ile
+// ulaşılır: InitializeXamlDiagnosticsEx (Microsoft.Internal.FrameworkUdk.dll)
+// bu DLL'i bir TAP olarak yükler (DllGetClassObject → ExplorerTweaksTap::
+// SetSite); TAP bir VisualTreeWatcher'ı bağlar (Advise) ve süreçteki her XAML
+// ağacına eklenen her eleman, kendi UI thread'inde OnVisualTreeChange'e gelir.
+//
+// TAP / visual tree watcher iskeleti, m417z'nin "Windows 11 File Explorer
+// Styler" Windhawk modundan (GPL-3.0) uyarlanmıştır:
+// https://github.com/ramensoftware/windhawk-mods/blob/main/mods/windows-11-file-explorer-styler.wh.cpp
+// Stil motoru alınmamıştır; yalnızca enjeksiyon/TAP/watcher kalıbı.
+//
+// Hedefler (Step 1 keşfi, Windows 11 26300):
+// - Toolbar: FileExplorerExtensions.CommandBarControl(_Wave1) → Collapsed.
+//   İçinde CommandBar#FileExplorerCommandBar ve
+//   CommandBar#FileExplorerSecondaryCommandBar vardır. Island yüksekliği
+//   Explorer'ca sabit hesaplanır; toolbar'ın boşluğu island yüksekliği kancasıyla
+//   (XamlIslandViewAdapter::get_DesiredSizeInPhysicalPixels) geri alınır ve
+//   FileExplorerExtensions.NavigationBarControl'e Grid.RowSpan=2,
+//   Margin=0,0,0,1 verilir (Styler'ın NoCommandBar değerleri).
+// - Tablar: TabView'ın satırı KORUNUR; title bar (caption düğmeleri ve sürükleme
+//   alanı, Win32 TITLE_BAR_SCAFFOLDING_WINDOW_CLASS penceresi) bu satırın
+//   üstünde durur. Satır kaldırılırsa o pencere adres satırının üstüne biner.
+//   Bunun yerine satırın içi boşaltılır:
+//   TabView > ... > Primitives.TabViewListView#TabListView → Collapsed ve
+//   TabView.IsAddTabButtonVisible = false (AddButton). Satır boş bir title bar
+//   şeridi olarak kalır.
+// Yalnızca bir FileExplorerExtensions.* atası olan TabView'lara dokunulur.
+
+namespace wux = winrt::Microsoft::UI::Xaml;
+using WinRtInspectable = winrt::Windows::Foundation::IInspectable;
+
+// {74119944-260C-4862-B4A1-CD36EFF6B18B}
+constexpr CLSID CLSID_ExplorerTweaksTap = {
+    0x74119944,
+    0x260c,
+    0x4862,
+    {0xb4, 0xa1, 0xcd, 0x36, 0xef, 0xf6, 0xb1, 0x8b}};
+
+// Styler'ın NoCommandBar teması: island yüksekliği 136 birimlik varsayılanın
+// 87'sine iner (toolbar satırı çıkar, tab ve adres satırları kalır).
+constexpr int kFrameHeightDefault = 136;
+constexpr int kFrameHeightNoCommandBar = 87;
+
+enum class XamlKind { TabList, TabView, CommandBar, NavigationBar };
+
+// Bir elemanın bir özelliğine yazdığımız yerel değer ve öncesindeki yerel değer
+// (ReadLocalValue: UnsetValue, düz değer ya da BindingExpression).
+struct XamlChange {
+    winrt::weak_ref<wux::DependencyObject> target;
+    wux::DependencyProperty property{nullptr};
+    WinRtInspectable oldValue{nullptr};
+};
+
+struct XamlTarget {
+    winrt::weak_ref<wux::FrameworkElement> element;
+    XamlKind kind;
+};
+
+// Bir XAML UI thread'inin durumu. İçerik yalnızca o thread'de okunur/yazılır;
+// harita yapısı g_collapsedMutex ile korunur. XAML'e dokunulurken kilit
+// tutulmaz (SetValue yeniden girişe yol açabilir): durum haritadan alınır
+// (TakeXamlState), işlenir ve geri konur (PutXamlState).
+struct XamlThreadState {
+    std::vector<XamlTarget> targets;  // izlenen adaylar (ayardan bağımsız)
+    std::vector<XamlChange> changes;  // yaptığımız ve geri alınacak değişiklikler
+};
+
+std::mutex g_collapsedMutex;
+std::unordered_map<DWORD, XamlThreadState> g_collapsed;  // thread id → durum
+
+XamlThreadState TakeXamlState() {
+    std::lock_guard<std::mutex> lock(g_collapsedMutex);
+    auto it = g_collapsed.find(GetCurrentThreadId());
+    if (it == g_collapsed.end()) {
+        return {};
+    }
+    XamlThreadState state = std::move(it->second);
+    g_collapsed.erase(it);
+    return state;
+}
+
+void PutXamlState(XamlThreadState state) {
+    if (state.targets.empty() && state.changes.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_collapsedMutex);
+    XamlThreadState& slot = g_collapsed[GetCurrentThreadId()];
+    // Arada (yeniden girişle) eklenenler daha yenidir; sona gelir.
+    state.targets.insert(state.targets.end(),
+                         std::make_move_iterator(slot.targets.begin()),
+                         std::make_move_iterator(slot.targets.end()));
+    state.changes.insert(state.changes.end(),
+                         std::make_move_iterator(slot.changes.begin()),
+                         std::make_move_iterator(slot.changes.end()));
+    slot = std::move(state);
+}
+
+bool SameObject(const WinRtInspectable& a, const WinRtInspectable& b) {
+    return a && b &&
+           a.as<winrt::Windows::Foundation::IUnknown>() ==
+               b.as<winrt::Windows::Foundation::IUnknown>();
+}
+
+bool HasThreadAccess(const wux::DependencyObject& obj) {
+    auto queue = obj.DispatcherQueue();
+    return queue && queue.HasThreadAccess();
+}
+
+XamlChange* FindChange(XamlThreadState& state,
+                       const wux::DependencyObject& obj,
+                       const wux::DependencyProperty& dp) {
+    for (XamlChange& change : state.changes) {
+        if (change.property == dp && SameObject(change.target.get(), obj)) {
+            return &change;
+        }
+    }
+    return nullptr;
+}
+
+// dp'ye value yazar. Önceki yerel değer yalnızca ilk yazımda kaydedilir; böylece
+// tekrar uygulamalar orijinali ezmez.
+void SetLocal(XamlThreadState& state,
+              const wux::DependencyObject& obj,
+              const wux::DependencyProperty& dp,
+              const WinRtInspectable& value) {
+    if (!FindChange(state, obj, dp)) {
+        state.changes.push_back(
+            {winrt::make_weak(obj), dp, obj.ReadLocalValue(dp)});
+    }
+    obj.SetValue(dp, value);
+}
+
+// Kaydedilen değişikliği geri alır. Eleman yaşamıyorsa ya da başka bir
+// thread'e aitse dokunulmaz.
+void RestoreChange(const XamlChange& change) {
+    auto obj = change.target.get();
+    if (!obj || !HasThreadAccess(obj)) {
+        return;
+    }
+    const WinRtInspectable& old = change.oldValue;
+    if (!old || old == wux::DependencyProperty::UnsetValue()) {
+        obj.ClearValue(change.property);
+    } else if (auto binding = old.try_as<wux::Data::BindingExpression>()) {
+        auto element = obj.try_as<wux::FrameworkElement>();
+        if (element && binding.ParentBinding()) {
+            element.SetBinding(change.property, binding.ParentBinding());
+        } else {
+            obj.ClearValue(change.property);
+        }
+    } else {
+        obj.SetValue(change.property, old);
+    }
+}
+
+// obj.dp üzerindeki değişikliğimizi (varsa) geri alır ve kaydı siler.
+void RestoreLocal(XamlThreadState& state,
+                  const wux::DependencyObject& obj,
+                  const wux::DependencyProperty& dp) {
+    for (auto it = state.changes.begin(); it != state.changes.end(); ++it) {
+        if (it->property == dp && SameObject(it->target.get(), obj)) {
+            XamlChange change = std::move(*it);
+            state.changes.erase(it);
+            RestoreChange(change);
+            return;
+        }
+    }
+}
+
+// collapsed: Visibility=Collapsed yazılır (önceki değer g_collapsed'da
+// saklanır); değilse önceki değer geri konur.
+void SetCollapsed(XamlThreadState& state,
+                  const wux::FrameworkElement& el,
+                  bool collapsed) {
+    const auto& dp = wux::UIElement::VisibilityProperty();
+    if (collapsed) {
+        SetLocal(state, el, dp, winrt::box_value(wux::Visibility::Collapsed));
+    } else {
+        RestoreLocal(state, el, dp);
+    }
+}
+
+// Elemanı geçerli ayarlara getirir (gizler ya da geri alır).
+void ApplyXamlTarget(XamlThreadState& state,
+                     const wux::FrameworkElement& el,
+                     XamlKind kind,
+                     const Settings& s) {
+    switch (kind) {
+        case XamlKind::TabList:
+            SetCollapsed(state, el, s.hideTabs);
+            break;
+        case XamlKind::TabView: {
+            const auto& dp =
+                wux::Controls::TabView::IsAddTabButtonVisibleProperty();
+            if (s.hideTabs) {
+                SetLocal(state, el, dp, winrt::box_value(false));
+            } else {
+                RestoreLocal(state, el, dp);
+            }
+            break;
+        }
+        case XamlKind::CommandBar:
+            SetCollapsed(state, el, s.hideCommandBar);
+            break;
+        case XamlKind::NavigationBar: {
+            const auto& rowSpan = wux::Controls::Grid::RowSpanProperty();
+            const auto& margin = wux::FrameworkElement::MarginProperty();
+            if (s.hideCommandBar) {
+                SetLocal(state, el, rowSpan, winrt::box_value(2));
+                SetLocal(state, el, margin,
+                         winrt::box_value(wux::Thickness{0, 0, 0, 1}));
+            } else {
+                RestoreLocal(state, el, rowSpan);
+                RestoreLocal(state, el, margin);
+            }
+            break;
+        }
+    }
+}
+
+void PruneDeadXaml(XamlThreadState& state) {
+    std::erase_if(state.targets,
+                  [](const XamlTarget& t) { return !t.element.get(); });
+    std::erase_if(state.changes,
+                  [](const XamlChange& c) { return !c.target.get(); });
+}
+
+// Yalnızca ilgilendiğimiz tipler; tip ve x:Name OnVisualTreeChange'ten gelir.
+std::optional<XamlKind> ClassifyXamlElement(std::wstring_view type,
+                                            std::wstring_view name) {
+    if (type == L"Microsoft.UI.Xaml.Controls.Primitives.TabViewListView" &&
+        name == L"TabListView") {
+        return XamlKind::TabList;
+    }
+    if (type == L"Microsoft.UI.Xaml.Controls.TabView") {
+        return XamlKind::TabView;
+    }
+    if (type == L"FileExplorerExtensions.CommandBarControl" ||
+        type == L"FileExplorerExtensions.CommandBarControl_Wave1") {
+        return XamlKind::CommandBar;
+    }
+    if (type == L"FileExplorerExtensions.NavigationBarControl") {
+        return XamlKind::NavigationBar;
+    }
+    return std::nullopt;
+}
+
+// Görsel ağaçta FileExplorerExtensions.* tipinde bir ata var mı? Explorer
+// dışındaki (ör. başka bir XAML penceresindeki) TabView'lara dokunulmaz.
+bool HasExplorerAncestor(wux::DependencyObject obj) {
+    for (int depth = 0; depth < 32; depth++) {
+        obj = wux::Media::VisualTreeHelper::GetParent(obj);
+        if (!obj) {
+            return false;
+        }
+        if (std::wstring_view(winrt::get_class_name(obj))
+                .starts_with(L"FileExplorerExtensions.")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// OnVisualTreeChange'ten (elemanın UI thread'inde) çağrılır.
+void OnXamlTargetAdded(const wux::FrameworkElement& el, XamlKind kind) {
+    if (!HasThreadAccess(el)) {
+        Wh_Log(L"XAML: element reported off its UI thread; skipped");
+        return;
+    }
+    if ((kind == XamlKind::TabList || kind == XamlKind::TabView) &&
+        !HasExplorerAncestor(el)) {
+        return;
+    }
+    XamlThreadState state = TakeXamlState();
+    if (state.targets.size() >= 32) {
+        PruneDeadXaml(state);
+    }
+    state.targets.push_back({winrt::make_weak(el), kind});
+    try {
+        ApplyXamlTarget(state, el, kind, GetConfig()->settings);
+    } catch (...) {
+        Wh_Log(L"XAML: applying to %s failed (0x%08X)",
+               winrt::get_class_name(el).c_str(),
+               static_cast<unsigned>(winrt::to_hresult()));
+    }
+    Wh_Log(L"XAML: tracking %s (thread %u)", winrt::get_class_name(el).c_str(),
+           GetCurrentThreadId());
+    PutXamlState(std::move(state));
+}
+
+// Bu thread'in izlenen elemanlarını geçerli ayarlara getirir. Elemanların UI
+// thread'inde çağrılır.
+void ReapplyXamlForCurrentThread() {
+    XamlThreadState state = TakeXamlState();
+    PruneDeadXaml(state);
+    auto config = GetConfig();
+    for (const XamlTarget& target : state.targets) {
+        auto el = target.element.get();
+        if (!el) {
+            continue;
+        }
+        try {
+            ApplyXamlTarget(state, el, target.kind, config->settings);
+        } catch (...) {
+            Wh_Log(L"XAML: reapply failed (0x%08X)",
+                   static_cast<unsigned>(winrt::to_hresult()));
+        }
+    }
+    PutXamlState(std::move(state));
+}
+
+// Bu thread'deki bütün değişiklikleri (ters sırayla) geri alır ve durumu bu
+// thread'de serbest bırakır. Elemanların UI thread'inde çağrılır.
+void RestoreXamlForCurrentThread() {
+    XamlThreadState state = TakeXamlState();
+    for (auto it = state.changes.rbegin(); it != state.changes.rend(); ++it) {
+        try {
+            RestoreChange(*it);
+        } catch (...) {
+            Wh_Log(L"XAML: restore failed (0x%08X)",
+                   static_cast<unsigned>(winrt::to_hresult()));
+        }
+    }
+}
+
+struct ThreadWindowSearch {
+    DWORD threadId;
+    HWND found;
+};
+
+BOOL CALLBACK FindThreadChildProc(HWND hwnd, LPARAM lParam) {
+    auto* search = reinterpret_cast<ThreadWindowSearch*>(lParam);
+    if (GetWindowThreadProcessId(hwnd, nullptr) == search->threadId) {
+        search->found = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+BOOL CALLBACK FindThreadTopLevelProc(HWND hwnd, LPARAM lParam) {
+    auto* search = reinterpret_cast<ThreadWindowSearch*>(lParam);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId()) {
+        EnumChildWindows(hwnd, FindThreadChildProc, lParam);
+    }
+    return search->found ? FALSE : TRUE;
+}
+
+BOOL CALLBACK FirstThreadWindowProc(HWND hwnd, LPARAM lParam) {
+    reinterpret_cast<ThreadWindowSearch*>(lParam)->found = hwnd;
+    return FALSE;
+}
+
+// threadId'ye ait bir pencere (RunOnWindowThread için): önce üst düzey
+// pencereler, yoksa bu süreçteki pencerelerin çocukları.
+HWND FindWindowOnThread(DWORD threadId) {
+    ThreadWindowSearch search{threadId, nullptr};
+    EnumThreadWindows(threadId, FirstThreadWindowProc,
+                      reinterpret_cast<LPARAM>(&search));
+    if (!search.found) {
+        EnumWindows(FindThreadTopLevelProc, reinterpret_cast<LPARAM>(&search));
+    }
+    return search.found;
+}
+
+// fn'i XAML durumu olan her UI thread'inde çalıştırır (kilit tutulmadan).
+// Ulaşılamayan thread sayısını döner.
+int RunOnXamlThreads(void (*fn)()) {
+    std::vector<DWORD> threads;
+    {
+        std::lock_guard<std::mutex> lock(g_collapsedMutex);
+        for (const auto& entry : g_collapsed) {
+            threads.push_back(entry.first);
+        }
+    }
+    int unreachable = 0;
+    for (DWORD threadId : threads) {
+        HWND hwnd = FindWindowOnThread(threadId);
+        if (!hwnd || !RunOnWindowThread(hwnd, fn)) {
+            Wh_Log(L"XAML: could not reach UI thread %u", threadId);
+            unreachable++;
+        }
+    }
+    return unreachable;
+}
+
+void ReapplyXaml() {
+    RunOnXamlThreads(ReapplyXamlForCurrentThread);
+}
+
+// Bütün XAML değişikliklerini sahibi olan UI thread'lerinde geri alır (mod
+// kaldırılırken). Ulaşılamayan thread'lerin durumu bilerek sızdırılır: XAML
+// nesneleri (BindingExpression gibi) sahibi olmayan thread'de serbest
+// bırakılmamalı ve DLL boşaltılırken statik yıkıcıda kalmamalıdır.
+void RestoreXaml() {
+    RunOnXamlThreads(RestoreXamlForCurrentThread);
+    std::lock_guard<std::mutex> lock(g_collapsedMutex);
+    if (!g_collapsed.empty()) {
+        Wh_Log(L"XAML: %zu UI thread(s) not restored; their elements keep "
+               L"the hidden state",
+               g_collapsed.size());
+        new std::unordered_map<DWORD, XamlThreadState>(std::move(g_collapsed));
+        g_collapsed.clear();
+    }
+}
+
+// ----- TAP and visual tree watcher -----
+
+HMODULE GetCurrentModuleHandle() {
+    HMODULE module = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&GetCurrentModuleHandle),
+                       &module);
+    return module;
+}
+
+// Wh_ModUninit'te true olur: OnVisualTreeChange hiçbir şey yapmaz.
+std::atomic<bool> g_xamlStopping{false};
+// O anda OnVisualTreeChange içinde olan çağrı sayısı (boşaltmadan önce sıfıra
+// inmesi beklenir).
+std::atomic<int> g_xamlCallbacks{0};
+
+class VisualTreeWatcher
+    : public winrt::implements<VisualTreeWatcher,
+                               IVisualTreeServiceCallback2,
+                               winrt::non_agile> {
+   public:
+    explicit VisualTreeWatcher(winrt::com_ptr<IXamlDiagnostics> diag)
+        : m_diag(std::move(diag)) {}
+
+    HRESULT Advise() {
+        HRESULT hr =
+            m_diag.as<IVisualTreeService3>()->AdviseVisualTreeChange(this);
+        if (SUCCEEDED(hr)) {
+            m_advised.store(true);
+        }
+        return hr;
+    }
+
+    HRESULT Unadvise() {
+        if (!m_advised.exchange(false)) {
+            return S_FALSE;
+        }
+        return m_diag.as<IVisualTreeService3>()->UnadviseVisualTreeChange(
+            this);
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    OnVisualTreeChange(ParentChildRelation,
+                       VisualElement element,
+                       VisualMutationType mutationType) override {
+        struct InFlight {
+            InFlight() { g_xamlCallbacks.fetch_add(1); }
+            ~InFlight() { g_xamlCallbacks.fetch_sub(1); }
+        } inFlight;
+        if (g_xamlStopping.load() || mutationType != Add) {
+            return S_OK;
+        }
+        std::wstring_view type = element.Type ? element.Type : L"";
+        std::wstring_view name = element.Name ? element.Name : L"";
+        std::optional<XamlKind> kind = ClassifyXamlElement(type, name);
+        if (!kind) {
+            return S_OK;
+        }
+        try {
+            WinRtInspectable inspectable;
+            winrt::check_hresult(m_diag->GetIInspectableFromHandle(
+                element.Handle,
+                reinterpret_cast<::IInspectable**>(
+                    winrt::put_abi(inspectable))));
+            if (auto el = inspectable.try_as<wux::FrameworkElement>()) {
+                OnXamlTargetAdded(el, *kind);
+            }
+        } catch (...) {
+            Wh_Log(L"XAML: OnVisualTreeChange(%.*s) failed (0x%08X)",
+                   static_cast<int>(type.size()), type.data(),
+                   static_cast<unsigned>(winrt::to_hresult()));
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnElementStateChanged(InstanceHandle,
+                                                    VisualElementState,
+                                                    LPCWSTR) override {
+        return S_OK;
+    }
+
+   private:
+    winrt::com_ptr<IXamlDiagnostics> m_diag;
+    std::atomic<bool> m_advised{false};
+};
+
+std::mutex g_watcherMutex;
+winrt::com_ptr<VisualTreeWatcher> g_watcher;
+// Bu DLL'in koduyla çalışan yardımcı thread'ler (advise ve enjeksiyon).
+// Boşaltmadan önce hepsinin bitmesi beklenir.
+std::vector<HANDLE> g_workerThreads;
+
+// Biten thread tutamaçlarını kapatır; g_watcherMutex altında çağrılır.
+void PruneFinishedWorkersLocked() {
+    std::erase_if(g_workerThreads, [](HANDLE thread) {
+        if (WaitForSingleObject(thread, 0) == WAIT_OBJECT_0) {
+            CloseHandle(thread);
+            return true;
+        }
+        return false;
+    });
+}
+
+// Thread'i (askıda oluşturulmuş) kaydeder ve başlatır.
+void StartWorker(HANDLE thread) {
+    {
+        std::lock_guard<std::mutex> lock(g_watcherMutex);
+        PruneFinishedWorkersLocked();
+        g_workerThreads.push_back(thread);
+    }
+    ResumeThread(thread);
+}
+
+DWORD WINAPI AdviseThreadProc(LPVOID param) {
+    // Styler'daki gibi: AdviseVisualTreeChange SetSite'ın thread'inde
+    // çağrılırsa bazen takılıyor; ayrı bir thread'de çağrılır.
+    std::unique_ptr<winrt::com_ptr<VisualTreeWatcher>> watcher(
+        static_cast<winrt::com_ptr<VisualTreeWatcher>*>(param));
+    if (g_xamlStopping.load()) {
+        return 0;
+    }
+    HRESULT hr = (*watcher)->Advise();
+    Wh_Log(L"XAML: AdviseVisualTreeChange: 0x%08X",
+           static_cast<unsigned>(hr));
+    return 0;
+}
+
+void StartWatcher(const winrt::com_ptr<IUnknown>& site) {
+    auto watcher =
+        winrt::make_self<VisualTreeWatcher>(site.as<IXamlDiagnostics>());
+    auto* param = new winrt::com_ptr<VisualTreeWatcher>(watcher);
+    HANDLE thread = CreateThread(nullptr, 0, AdviseThreadProc, param,
+                                 CREATE_SUSPENDED, nullptr);
+    if (!thread) {
+        Wh_Log(L"XAML: CreateThread failed (%u)", GetLastError());
+        delete param;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_watcherMutex);
+        if (g_watcher) {
+            Wh_Log(L"XAML: replacing an existing watcher");
+            g_watcher->Unadvise();
+        }
+        g_watcher = watcher;
+    }
+    StartWorker(thread);
+}
+
+class ExplorerTweaksTap
+    : public winrt::implements<ExplorerTweaksTap,
+                               IObjectWithSite,
+                               winrt::non_agile> {
+   public:
+    HRESULT STDMETHODCALLTYPE SetSite(IUnknown* site) noexcept override try {
+        m_site.copy_from(site);
+        if (!m_site) {
+            return S_OK;
+        }
+        if (!m_moduleRefReleased) {
+            // InitializeXamlDiagnosticsEx bu DLL'i LoadLibrary ile bir kez daha
+            // yükledi; o referans bırakılır ki Windhawk modu boşaltabilsin.
+            m_moduleRefReleased = true;
+            FreeLibrary(GetCurrentModuleHandle());
+        }
+        if (g_unloading.load() || g_xamlStopping.load()) {
+            return S_OK;
+        }
+        StartWatcher(m_site);
+        return S_OK;
+    } catch (...) {
+        HRESULT hr = winrt::to_hresult();
+        Wh_Log(L"XAML: SetSite failed (0x%08X)", static_cast<unsigned>(hr));
+        return hr;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetSite(REFIID riid,
+                                      void** ppvSite) noexcept override {
+        if (!ppvSite) {
+            return E_POINTER;
+        }
+        *ppvSite = nullptr;
+        if (!m_site) {
+            return E_FAIL;
+        }
+        return m_site->QueryInterface(riid, ppvSite);
+    }
+
+   private:
+    winrt::com_ptr<IUnknown> m_site;
+    bool m_moduleRefReleased = false;
+};
+
+template <typename T>
+struct SimpleFactory
+    : winrt::implements<SimpleFactory<T>, IClassFactory, winrt::non_agile> {
+    HRESULT STDMETHODCALLTYPE CreateInstance(IUnknown* outer,
+                                             REFIID riid,
+                                             void** ppv) noexcept override try {
+        if (!ppv) {
+            return E_POINTER;
+        }
+        *ppv = nullptr;
+        if (outer) {
+            return CLASS_E_NOAGGREGATION;
+        }
+        return winrt::make<T>().as(riid, ppv);
+    } catch (...) {
+        return winrt::to_hresult();
+    }
+
+    HRESULT STDMETHODCALLTYPE LockServer(BOOL) noexcept override {
+        return S_OK;
+    }
+};
+
+// XAML Diagnostics TAP'ı bu fonksiyonla oluşturur (dışa aktarılır).
+STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) try {
+    if (!ppv) {
+        return E_POINTER;
+    }
+    *ppv = nullptr;
+    if (rclsid != CLSID_ExplorerTweaksTap) {
+        return CLASS_E_CLASSNOTAVAILABLE;
+    }
+    return winrt::make<SimpleFactory<ExplorerTweaksTap>>().as(riid, ppv);
+} catch (...) {
+    return winrt::to_hresult();
+}
+
+// DLL'in ömrünü Windhawk yönetir; COM boşaltmaz.
+STDAPI DllCanUnloadNow() {
+    return S_FALSE;
+}
+
+// Bağlayıcı (lld, --export-all-symbols ile bile) Dll* COM giriş noktalarını
+// otomatik dışa aktarmaz; açıkça dışa aktarılır. XAML Diagnostics TAP'ı
+// GetProcAddress(DllGetClassObject) ile bulur.
+__attribute__((used, section(".drectve"))) static const char kComExports[] =
+    " -export:DllGetClassObject -export:DllCanUnloadNow";
+
+// ----- Injection -----
+
+enum TapState : int { kTapIdle, kTapInjecting, kTapInjected };
+std::atomic<int> g_tapState{kTapIdle};
+// Wh_ModBeforeUninit'te sinyallenir: enjeksiyon thread'i beklemeyi bırakır.
+HANDLE g_stopEvent = nullptr;
+
+constexpr int kInjectAttempts = 20;
+constexpr DWORD kInjectRetryMs = 500;
+
+BOOL CALLBACK FindExplorerXamlProc(HWND hwnd, LPARAM lParam) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId() && HasClassName(hwnd, L"CabinetWClass")) {
+        auto* result = reinterpret_cast<int*>(lParam);
+        *result |= 1;
+        if (FindWindowExW(hwnd, nullptr,
+                          L"Microsoft.UI.Content.DesktopChildSiteBridge",
+                          nullptr)) {
+            *result |= 2;
+        }
+    }
+    return TRUE;
+}
+
+// Bu süreçte Explorer penceresi var mı (bit 0) ve en az birinin XAML island'ı
+// kurulmuş mu (bit 1)?
+int ScanExplorerWindows() {
+    int result = 0;
+    EnumWindows(FindExplorerXamlProc, reinterpret_cast<LPARAM>(&result));
+    return result;
+}
+
+using InitializeXamlDiagnosticsEx_t = decltype(&InitializeXamlDiagnosticsEx);
+
+// WinUI 3 XAML Diagnostics'i başlatır; TAP'ı (bu DLL) yükler. Bağlantı adı
+// önceki yüklemelerde (ör. mod yeniden açıldı) kullanıldıysa ERROR_NOT_FOUND
+// döner; sıradaki ad denenir.
+HRESULT InjectTap() {
+    HMODULE udk = GetModuleHandleW(L"Microsoft.Internal.FrameworkUdk.dll");
+    if (!udk) {
+        return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
+    }
+    auto initialize = reinterpret_cast<InitializeXamlDiagnosticsEx_t>(
+        GetProcAddress(udk, "InitializeXamlDiagnosticsEx"));
+    if (!initialize) {
+        return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+    }
+    wchar_t location[MAX_PATH];
+    DWORD len = GetModuleFileNameW(GetCurrentModuleHandle(), location,
+                                   ARRAYSIZE(location));
+    if (len == 0 || len >= ARRAYSIZE(location)) {
+        return E_UNEXPECTED;
+    }
+    HRESULT hr = E_FAIL;
+    for (int i = 1; i <= 10000; i++) {
+        wchar_t connection[64];
+        StringCchPrintfW(connection, ARRAYSIZE(connection),
+                         L"WinUIVisualDiagConnection%d", i);
+        hr = initialize(connection, GetCurrentProcessId(), L"", location,
+                        CLSID_ExplorerTweaksTap, nullptr);
+        if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
+            break;
+        }
+    }
+    return hr;
+}
+
+// XAML island hazır olana kadar (en fazla ~10 sn) bekler ve TAP'ı bir kez
+// enjekte eder. Başaramazsa durum kTapIdle'a döner; sonraki Explorer penceresi
+// yeniden dener.
+DWORD WINAPI InjectThreadProc(LPVOID) {
+    for (int attempt = 0; attempt < kInjectAttempts; attempt++) {
+        if (WaitForSingleObject(g_stopEvent, attempt ? kInjectRetryMs : 0) !=
+            WAIT_TIMEOUT) {
+            break;
+        }
+        if (!(ScanExplorerWindows() & 2) ||
+            !GetModuleHandleW(L"Microsoft.Internal.FrameworkUdk.dll")) {
+            continue;  // XAML henüz yok
+        }
+        HRESULT hr = InjectTap();
+        Wh_Log(L"XAML: InitializeXamlDiagnosticsEx: 0x%08X",
+               static_cast<unsigned>(hr));
+        if (SUCCEEDED(hr)) {
+            g_tapState.store(kTapInjected);
+            return 0;
+        }
+    }
+    g_tapState.store(kTapIdle);
+    return 0;
+}
+
+// Tab ya da toolbar gizleme açıksa ve süreç başına daha önce yapılmadıysa
+// enjeksiyonu (ayrı bir thread'de) başlatır. Bloklamaz.
+void RequestTapInjection() {
+    if (g_unloading.load() || !g_stopEvent) {
+        return;
+    }
+    auto config = GetConfig();
+    if (!config->settings.hideTabs && !config->settings.hideCommandBar) {
+        return;
+    }
+    int expected = kTapIdle;
+    if (!g_tapState.compare_exchange_strong(expected, kTapInjecting)) {
+        return;
+    }
+    HANDLE thread = CreateThread(nullptr, 0, InjectThreadProc, nullptr,
+                                 CREATE_SUSPENDED, nullptr);
+    if (!thread) {
+        Wh_Log(L"XAML: CreateThread failed (%u)", GetLastError());
+        g_tapState.store(kTapIdle);
+        return;
+    }
+    StartWorker(thread);
+}
+
+// Enjeksiyonu ve watcher'ı durdurur; bu DLL'in kodunu çalıştıran hiçbir
+// yardımcı thread ya da XAML geri çağrısı kalmayana kadar bekler (Wh_ModUninit).
+void StopXaml() {
+    g_xamlStopping.store(true);
+    if (g_stopEvent) {
+        SetEvent(g_stopEvent);
+    }
+
+    // Yardımcı thread'ler (enjeksiyon, advise). Enjeksiyon SetSite'ı ve yeni bir
+    // advise thread'ini tetikleyebilir; liste boşalana kadar tekrarlanır.
+    for (;;) {
+        std::vector<HANDLE> threads;
+        {
+            std::lock_guard<std::mutex> lock(g_watcherMutex);
+            threads.swap(g_workerThreads);
+        }
+        if (threads.empty()) {
+            break;
+        }
+        for (HANDLE thread : threads) {
+            if (WaitForSingleObject(thread, 10000) != WAIT_OBJECT_0) {
+                Wh_Log(L"XAML: worker thread did not finish; unloading is "
+                       L"unsafe");
+            }
+            CloseHandle(thread);
+        }
+    }
+
+    winrt::com_ptr<VisualTreeWatcher> watcher;
+    {
+        std::lock_guard<std::mutex> lock(g_watcherMutex);
+        watcher = std::move(g_watcher);
+    }
+    if (watcher) {
+        HRESULT hr = watcher->Unadvise();
+        Wh_Log(L"XAML: UnadviseVisualTreeChange: 0x%08X",
+               static_cast<unsigned>(hr));
+    }
+    // Unadvise öncesinde başlamış geri çağrılar.
+    for (int i = 0; i < 5000 && g_xamlCallbacks.load() > 0; i++) {
+        Sleep(1);
+    }
+    if (g_xamlCallbacks.load() > 0) {
+        Wh_Log(L"XAML: %d visual tree callback(s) still running",
+               g_xamlCallbacks.load());
+    }
+    // Son referans: XAML Diagnostics kendi referansını Unadvise'da bıraktı.
+    watcher = nullptr;
+}
+
+// Island yüksekliği değiştiğinde Explorer'ın yeniden ölçmesi için açık
+// pencerelere (aynı boyutla) WM_SIZE bırakır. Mod kodu çalıştırmaz.
+BOOL CALLBACK NudgeExplorerProc(HWND hwnd, LPARAM) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == GetCurrentProcessId() && HasClassName(hwnd, L"CabinetWClass") &&
+        !IsIconic(hwnd)) {
+        RECT rc;
+        if (GetClientRect(hwnd, &rc)) {
+            PostMessageW(hwnd, WM_SIZE,
+                         IsZoomed(hwnd) ? SIZE_MAXIMIZED : SIZE_RESTORED,
+                         MAKELPARAM(rc.right - rc.left, rc.bottom - rc.top));
+        }
+    }
+    return TRUE;
+}
+
+void NudgeExplorerLayouts() {
+    EnumWindows(NudgeExplorerProc, 0);
+}
+
 // ===== Hooks =====
 
 using CreateWindowExW_t = decltype(&CreateWindowExW);
@@ -1714,10 +2575,21 @@ HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle,
     HWND hwnd = CreateWindowExW_Original(dwExStyle, lpClassName, lpWindowName,
                                          dwStyle, X, Y, nWidth, nHeight,
                                          hWndParent, hMenu, hInstance, lpParam);
+    if (!hwnd || g_unloading.load()) {
+        return hwnd;
+    }
     // Pencereyi oluşturan thread'deyiz, doğrudan subclass edilebilir.
-    if (hwnd && hWndParent && (dwStyle & WS_CHILD) &&
-        IsNavTree(hwnd, hWndParent)) {
+    if (hWndParent && (dwStyle & WS_CHILD) && IsNavTree(hwnd, hWndParent)) {
         AttachTree(hwnd);
+    }
+    // Explorer penceresi ya da onun XAML island'ı oluştu: TAP henüz
+    // enjekte edilmediyse enjeksiyon thread'i XAML hazır olunca enjekte eder.
+    if (g_tapState.load() == kTapIdle &&
+        (HasClassName(hwnd, L"CabinetWClass") ||
+         (hWndParent &&
+          HasClassName(hwnd, L"Microsoft.UI.Content.DesktopChildSiteBridge") &&
+          HasClassName(GetAncestor(hwnd, GA_ROOT), L"CabinetWClass")))) {
+        RequestTapInjection();
     }
     return hwnd;
 }
@@ -1729,10 +2601,60 @@ using CNscTree_SetStateImageList_t = HRESULT (*)(void*, HIMAGELIST);
 CNscTree_SetStateImageList_t CNscTree_SetStateImageList_Original;
 
 HRESULT CNscTree_SetStateImageList_Hook(void* pThis, HIMAGELIST himl) {
-    if (GetConfig()->settings.hidePins) {
+    if (!g_unloading.load() && GetConfig()->settings.hidePins) {
         return S_OK;
     }
     return CNscTree_SetStateImageList_Original(pThis, himl);
+}
+
+// XamlIslandViewAdapter::get_DesiredSizeInPhysicalPixels
+// (Windows.UI.FileExplorer.dll): Explorer XAML island'ının yüksekliğini buradan
+// alır; island içeriğin boyuna göre küçülmez. Toolbar gizliyken yükseklik
+// Styler'ın NoCommandBar değerine (136'da 87) ölçeklenir, böylece toolbar'ın
+// yeri boş bir şerit olarak kalmaz.
+using XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_t =
+    HRESULT (*)(void*, SIZE*);
+XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_t
+    XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Original;
+
+HRESULT XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Hook(
+    void* pThis,
+    SIZE* size) {
+    HRESULT hr =
+        XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Original(pThis,
+                                                                       size);
+    if (SUCCEEDED(hr) && size && size->cy > 0 && !g_unloading.load() &&
+        GetConfig()->settings.hideCommandBar) {
+        size->cy =
+            MulDiv(size->cy, kFrameHeightNoCommandBar, kFrameHeightDefault);
+    }
+    return hr;
+}
+
+// Sembol bulunamazsa toolbar yine gizlenir ama yeri boş bir şerit kalır.
+void HookIslandHeight() {
+    HMODULE module = GetModuleHandleW(L"Windows.UI.FileExplorer.dll");
+    if (!module) {
+        module = LoadLibraryExW(L"Windows.UI.FileExplorer.dll", nullptr,
+                                LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+    if (!module) {
+        Wh_Log(L"island height hook unavailable (module not loaded)");
+        return;
+    }
+    WindhawkUtils::SYMBOL_HOOK hooks[] = {
+        {
+            {L"public: virtual long __cdecl "
+             L"XamlIslandViewAdapter::get_DesiredSizeInPhysicalPixels(struct "
+             L"tagSIZE *)"},
+            &XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Original,
+            XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Hook,
+            false,
+        },
+    };
+    if (!WindhawkUtils::HookSymbols(module, hooks, ARRAYSIZE(hooks))) {
+        Wh_Log(L"island height hook unavailable");
+    }
 }
 
 // Sembol bulunamazsa ya da kancalanamazsa yalnızca açık ağaçlardaki listeler
@@ -1764,6 +2686,9 @@ void HookPinIcons() {
 // ===== Mod lifecycle =====
 
 BOOL Wh_ModInit() {
+    g_runMsg = RegisterWindowMessageW(L"ExplorerTweaks_Run");
+    g_reapplyMsg = RegisterWindowMessageW(L"ExplorerTweaks_Reapply");
+    g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     ReloadConfig();
     ApplyHidden();
     if (!WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook,
@@ -1771,6 +2696,7 @@ BOOL Wh_ModInit() {
         Wh_Log(L"CreateWindowExW hook failed; only existing windows sorted");
     }
     HookPinIcons();
+    HookIslandHeight();
     return TRUE;
 }
 
@@ -1785,15 +2711,97 @@ void Wh_ModAfterInit() {
             ResortTree(tree);
         });
     });
+    // Açık Explorer penceresi varsa TAP hemen (XAML hazırsa) enjekte edilir;
+    // yoksa ilk pencere oluşunca CreateWindowExW kancası tetikler.
+    if (ScanExplorerWindows() & 1) {
+        RequestTapInjection();
+        if (GetConfig()->settings.hideCommandBar) {
+            NudgeExplorerLayouts();
+        }
+    }
 }
 
+// Kancalar bundan sonra kaldırılır; o ana kadar hiçbir şey eklemezler ve
+// davranışı değiştirmezler.
+void Wh_ModBeforeUninit() {
+    g_unloading.store(true);
+    if (g_stopEvent) {
+        SetEvent(g_stopEvent);
+    }
+}
+
+// Kancalar kaldırıldıktan sonra, DLL boşaltılmadan önce çağrılır. Sıra:
+// XAML watcher'ı durdur → XAML'i geri al → registry'yi geri yükle → ağaçları
+// ayır. Sonunda mod koduna işaret eden hiçbir subclass, kanca, geri çağrılı
+// zamanlayıcı, XAML geri çağrısı ya da yardımcı thread kalmamalıdır.
 void Wh_ModUninit() {
+    g_unloading.store(true);
+    bool hadCommandBarHidden = GetConfig()->settings.hideCommandBar;
+
+    // 1. TAP/watcher: enjeksiyon ve advise thread'lerini bekle, Unadvise.
+    StopXaml();
+    // 2. XAML değişikliklerini sahibi olan UI thread'lerinde geri al.
+    RestoreXaml();
+    if (hadCommandBarHidden) {
+        // Island yükseklik kancası kalktı; Explorer yeniden ölçsün.
+        NudgeExplorerLayouts();
+    }
+    // 3. Registry ile gizleme.
     RestoreAllHidden();
+
+    // 4. Ağaçlar: adlar kuralsız bir Config ile orijinallerine döner, sonra
+    // subclass'lar kaldırılır, zamanlayıcılar öldürülür ve state image list
+    // geri konur. Her ağacın kendi thread'inde.
+    {
+        auto empty = std::make_shared<Config>();
+        empty->settings.hideTabs = false;
+        empty->settings.hideCommandBar = false;
+        empty->settings.hidePins = false;
+        empty->settings.pinnedPosition = PinnedPosition::Default;
+        std::shared_ptr<const Config> old;
+        std::lock_guard<std::mutex> lock(g_configMutex);
+        old = std::exchange(g_config, std::move(empty));
+    }
+    std::vector<HWND> trees;
+    {
+        std::lock_guard<std::mutex> lock(g_treesMutex);
+        trees.assign(g_trees.begin(), g_trees.end());
+    }
+    for (HWND tree : trees) {
+        RunOnWindowThread(tree, [tree] {
+            if (!GetTreeState(tree)) {
+                return;  // yok edildi (WM_NCDESTROY zaten ayırdı)
+            }
+            ReapplyNames(tree);
+            DetachTree(tree);
+        });
+        std::lock_guard<std::mutex> lock(g_treesMutex);
+        if (g_trees.count(tree)) {
+            Wh_Log(L"Uninit: tree %p could not be detached on its thread; its "
+                   L"subclass stays installed (unsafe after unload)",
+                   tree);
+        }
+    }
+
+    if (g_stopEvent) {
+        CloseHandle(g_stopEvent);
+        g_stopEvent = nullptr;
+    }
 }
 
 void Wh_ModSettingsChanged() {
+    bool oldHideCommandBar = GetConfig()->settings.hideCommandBar;
     ReloadConfig();
     ApplyHidden();
+
+    // XAML: izlenen elemanlar yeni ayarlara getirilir; gizleme yeni açıldıysa
+    // ve TAP yoksa enjeksiyon başlar (mevcut pencereler Advise'da yeniden
+    // bildirilir).
+    ReapplyXaml();
+    RequestTapInjection();
+    if (GetConfig()->settings.hideCommandBar != oldHideCommandBar) {
+        NudgeExplorerLayouts();
+    }
 
     // Bağlı tüm ağaçlar (Explorer pencereleri ve Explorer'ın barındırdığı
     // dosya diyalogları). Kopya kilit altında alınır, kilit RunOnWindowThread
