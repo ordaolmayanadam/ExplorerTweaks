@@ -35,12 +35,15 @@ modlara bağlı değildir.
 `match` büyük/küçük harf duyarsız tam ad ya da `{CLSID}` olabilir. Listede
 olmayan öğeler listedekilerden sonra, kendi sıralarıyla gelir.
 
-Varsayılan ayardaki Phone CLSID'si (`{3611C374-...}`) **her bilgisayarda aynı
-olmayabilir**. Kendi öğenizin CLSID'sini şu kayıt defteri anahtarının altından
-bulabilirsiniz:
+Varsayılan ayardaki Phone CLSID'si (`{3611C374-...}`) kullanıcılar ve cihazlar
+arasında farklı olabilir. Kendi CLSID'nizi şu kayıt defteri anahtarının altında
+arayın:
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace`
-Telefon eşleşmiyorsa o satırdaki `match` değerini kendi CLSID'nizle değiştirin
-(ya da öğenin görünen adını yazın).
+Telefon öğesi Phone Link'in (CrossDevice) kök girdisidir: varsayılan değeri
+`CrossDevice` ile başlayan alt anahtarın adı sizin CLSID'nizdir. Telefonun
+görünen adı ise `HKCU\Software\Classes\CLSID\{o CLSID}` anahtarının varsayılan
+değerindedir. Telefon eşleşmiyorsa o satırdaki `match` değerini kendi
+CLSID'nizle değiştirin (ya da öğenin görünen adını yazın).
 
 ## Bilinen kısıtlar
 

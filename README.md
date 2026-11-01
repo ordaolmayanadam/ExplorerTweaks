@@ -70,13 +70,13 @@ Kurallar:
 
 ### Kendi Phone CLSID'nizi bulma
 
-Varsayılan ayardaki Phone CLSID'si (`{3611C374-393E-41F8-98EB-1AD7BF051346}`) **her kullanıcıda ve cihazda aynı olmayabilir**; öğe kullanıcıya ve eşleştirilen telefona göre oluşur. Kendi CLSID'nizi şu kayıt defteri anahtarının altından bulabilirsiniz:
+Varsayılan ayardaki Phone CLSID'si (`{3611C374-393E-41F8-98EB-1AD7BF051346}`) kullanıcılar ve cihazlar arasında farklı olabilir. Kendi CLSID'nizi şu kayıt defteri anahtarının altında arayın:
 
 ```
 HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace
 ```
 
-Alt anahtarlardan birinin varsayılan değeri telefonunuzun adıdır. O anahtarın adı (`{...}` biçiminde) sizin CLSID'nizdir; `match` alanına onu yazın. Dilerseniz CLSID yerine öğenin görünen adını da yazabilirsiniz.
+Telefon öğesi, Phone Link'in (CrossDevice) kök girdisidir: alt anahtarlardan, varsayılan değeri `CrossDevice` ile başlayanı bulun (örneğin `CrossDevice!!S-1-5-21-...!CrossDeviceRoot...`). Telefonun görünen adı bu değerde değil, `HKCU\Software\Classes\CLSID\{o CLSID}` anahtarının varsayılan değerindedir. Alt anahtarın adı (`{...}` biçiminde) sizin CLSID'nizdir; `match` alanına onu yazın. Dilerseniz CLSID yerine öğenin görünen adını da yazabilirsiniz.
 
 CLSID'si çözülemeyen bir kural (örneğin telefon o an bağlı değilken) mod tarafından otomatik olarak yeniden denenir.
 
