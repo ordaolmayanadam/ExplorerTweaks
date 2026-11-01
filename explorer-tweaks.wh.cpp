@@ -113,6 +113,30 @@ inline int FindRule(const std::vector<NavRule>& rules,
     return -1;
 }
 
+// Çözülememiş (eşleşme metni boş) bir CLSID kuralı var mı?
+inline bool HasUnresolvedClsid(const std::vector<NavRule>& rules,
+                               const std::vector<std::wstring>& effectiveMatch) {
+    for (size_t i = 0; i < rules.size(); i++) {
+        if (IsClsidString(rules[i].match) &&
+            (i >= effectiveMatch.size() || effectiveMatch[i].empty())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Son denemeden (last) bu yana interval dolduysa 0, dolmadıysa kalan süre.
+// Saat geride görünürse (now < last) tam interval beklenir.
+inline unsigned long long RetryDelay(unsigned long long now,
+                                     unsigned long long last,
+                                     unsigned long long interval) {
+    if (now < last) {
+        return interval;
+    }
+    unsigned long long elapsed = now - last;
+    return elapsed >= interval ? 0 : interval - elapsed;
+}
+
 // Orijinal adı original olan öğenin yeni adı; yeniden adlandırılmıyorsa boş.
 // Dönen görünüm rules'un ömrüne bağlıdır.
 inline std::wstring_view NewNameFor(const std::vector<NavRule>& rules,
@@ -210,6 +234,8 @@ inline std::vector<int> ComputeOrder(
 
 #include <commctrl.h>
 #include <shlobj.h>
+#define STRSAFE_NO_DEPRECATE
+#include <strsafe.h>
 #include <windhawk_utils.h>
 
 #include <atomic>
@@ -345,11 +371,17 @@ struct ComScope {
     ComScope& operator=(const ComScope&) = delete;
 };
 
+// Son CLSID çözüm denemesinin zamanı (GetTickCount64), süreç genelinde.
+// Çözülemeyen CLSID kurallarının yeniden denenmesini kısar.
+constexpr unsigned long long kResolveRetryMs = 5000;
+std::atomic<unsigned long long> g_lastResolveAttempt{0};
+
 // Ayarları okur, kuralları çözer ve yeni Config'i yayınlar. Yalnızca
 // Wh_ModInit ve Wh_ModSettingsChanged thread'lerinden çağrılır; CLSID çözümü
 // için COM burada başlatılır.
 void ReloadConfig() {
     ComScope com;
+    g_lastResolveAttempt.store(GetTickCount64());
     auto config = std::make_shared<Config>();
     config->settings = LoadSettings();
     config->effectiveMatch = ResolveRules(config->settings);
@@ -463,7 +495,11 @@ void RunOnWindowThread(HWND hwnd, std::function<void()> fn) {
 
 constexpr UINT_PTR kTreeId = 0xE7;    // ağaç subclass ve zamanlayıcı kimliği
 constexpr UINT_PTR kParentId = 0xE8;  // NamespaceTreeControl subclass kimliği
+constexpr UINT_PTR kRetryTimerId = 0xE9;  // ertelenmiş CLSID yeniden denemesi
 constexpr UINT kResortDelayMs = 50;
+
+// Ağaca gönderilir (PostMessage): adları yeniden uygula ve yeniden sırala.
+UINT g_reapplyMsg = RegisterWindowMessageW(L"ExplorerTweaks_Reapply");
 
 std::mutex g_treesMutex;
 std::unordered_set<HWND> g_trees;
@@ -478,9 +514,6 @@ struct TreeState {
     // Yeniden adlandırılmış kök çocuklarının orijinal adları (g_originalNames).
     // Yalnızca yeniden adlandırılan öğeler için kayıt vardır.
     std::unordered_map<HTREEITEM, std::wstring> originalNames;
-    // TVN_GETDISPINFOW cevabında pszText'in gösterdiği tampon. Ağaç metni
-    // bildirim döner dönmez kullanır; bir sonraki bildirime kadar geçerlidir.
-    std::wstring dispText;
 };
 
 LRESULT CALLBACK TreeSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR,
@@ -849,6 +882,79 @@ LRESULT OnSetItem(HWND tree, TreeState* state, WPARAM wParam, LPARAM lParam) {
     return result;
 }
 
+// Bağlı tüm ağaçlara adları yeniden uygulama + yeniden sıralama mesajı
+// bırakır. Bloklamaz: her ağaç mesajı kendi thread'inde işler. Tutamaç bu
+// arada başka bir pencereye geçmişse kayıtlı mesaj o pencerece yok sayılır.
+void PostReapplyToAllTrees() {
+    if (!g_reapplyMsg) {
+        return;
+    }
+    std::vector<HWND> trees;
+    {
+        std::lock_guard<std::mutex> lock(g_treesMutex);
+        trees.assign(g_trees.begin(), g_trees.end());
+    }
+    for (HWND tree : trees) {
+        PostMessageW(tree, g_reapplyMsg, 0, 0);
+    }
+}
+
+// Mevcut Config'te çözülemeyen CLSID kuralı varsa (ör. Phone Link isim alanı
+// Explorer açılışında henüz hazır değildi) çözümü yeniden dener. Süreç
+// genelinde en fazla kResolveRetryMs'de bir dener; süre dolmamışsa kalan süre
+// için bu ağaçta bir zamanlayıcı kurar. Ağacın (STA) UI thread'inde çağrılır.
+// Kabuk çağrıları hiçbir kilit tutulmadan yapılır.
+void RetryClsidResolution(HWND tree) {
+    auto base = GetConfig();
+    if (!HasUnresolvedClsid(base->settings.navItems, base->effectiveMatch)) {
+        return;
+    }
+
+    unsigned long long now = GetTickCount64();
+    unsigned long long last = g_lastResolveAttempt.load();
+    unsigned long long wait = RetryDelay(now, last, kResolveRetryMs);
+    if (wait) {
+        SetTimer(tree, kRetryTimerId, static_cast<UINT>(wait), nullptr);
+        return;
+    }
+    // Aynı anda başka bir thread de denemek isteyebilir; yalnızca biri kazanır.
+    if (!g_lastResolveAttempt.compare_exchange_strong(last, now)) {
+        return;
+    }
+
+    std::vector<std::wstring> match = base->effectiveMatch;
+    match.resize(base->settings.navItems.size());
+    {
+        // UI thread zaten STA'dır; bu çağrı S_FALSE döner ve CoUninitialize
+        // yalnızca bu sayacı dengeler. Başka modda başlatılmışsa dokunulmaz.
+        ComScope com;
+        for (size_t i = 0; i < match.size(); i++) {
+            const std::wstring& rule = base->settings.navItems[i].match;
+            if (IsClsidString(rule) && match[i].empty()) {
+                match[i] = ResolveClsidDisplayName(rule);
+            }
+        }
+    }
+    if (match == base->effectiveMatch) {
+        return;  // hâlâ çözülemedi; bir sonraki tetiklemede yeniden denenir
+    }
+
+    auto config = std::make_shared<Config>();
+    config->settings = base->settings;
+    config->effectiveMatch = std::move(match);
+    std::shared_ptr<const Config> old;
+    {
+        std::lock_guard<std::mutex> lock(g_configMutex);
+        if (g_config != base) {
+            // Bu arada ayarlar yeniden yüklendi; o yükleme kendi çözümünü yaptı.
+            return;
+        }
+        old = std::exchange(g_config, std::move(config));
+    }
+    Wh_Log(L"RetryClsidResolution: resolved CLSID rule(s) late");
+    PostReapplyToAllTrees();
+}
+
 LRESULT CALLBACK ParentSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR,
                                     DWORD_PTR);
 
@@ -856,6 +962,7 @@ LRESULT CALLBACK ParentSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR,
 // bırakır. Ağacın thread'inde çağrılmalıdır.
 void DetachTree(HWND tree) {
     KillTimer(tree, kTreeId);
+    KillTimer(tree, kRetryTimerId);
     TreeState* state = GetTreeState(tree);
     RemoveWindowSubclass(tree, TreeSubclassProc, kTreeId);
     if (HWND parent = GetAncestor(tree, GA_PARENT)) {
@@ -873,6 +980,11 @@ LRESULT CALLBACK TreeSubclassProc(HWND hwnd,
                                   UINT_PTR,
                                   DWORD_PTR refData) {
     auto* state = reinterpret_cast<TreeState*>(refData);
+    if (msg == g_reapplyMsg && g_reapplyMsg) {
+        ReapplyNames(hwnd);
+        ResortTree(hwnd);
+        return 0;
+    }
     switch (msg) {
         case TVM_INSERTITEMW:
             if (lParam) {
@@ -892,7 +1004,15 @@ LRESULT CALLBACK TreeSubclassProc(HWND hwnd,
         case WM_TIMER:
             if (wParam == kTreeId) {
                 KillTimer(hwnd, kTreeId);
+                // Yeni çözülürse Config yayınlanır ve tüm ağaçlara (bu ağaç
+                // dahil) yeniden uygulama mesajı bırakılır.
+                RetryClsidResolution(hwnd);
                 ResortTree(hwnd);
+                return 0;
+            }
+            if (wParam == kRetryTimerId) {
+                KillTimer(hwnd, kRetryTimerId);
+                RetryClsidResolution(hwnd);
                 return 0;
             }
             break;
@@ -905,8 +1025,11 @@ LRESULT CALLBACK TreeSubclassProc(HWND hwnd,
 }
 
 // Callback metinli bir kök çocuğunun TVN_GETDISPINFOW cevabını kurala göre
-// yeni adla değiştirir ve orijinal adı kaydeder.
-void FixDispInfo(NMTVDISPINFOW* info) {
+// yeni adla değiştirir ve orijinal adı kaydeder. buffer/cchBuffer, ağacın
+// bildirimden önce verdiği tampondur. Yeni ad bu tampona kopyalanır ve
+// pszText ona geri çevrilir; böylece ağacın elinde bizim belleğimize işaret
+// eden bir gösterici kalmaz.
+void FixDispInfo(NMTVDISPINFOW* info, LPWSTR buffer, int cchBuffer) {
     HWND tree = info->hdr.hwndFrom;
     TVITEMW& item = info->item;
     if (!(item.mask & TVIF_TEXT)) {
@@ -924,15 +1047,20 @@ void FixDispInfo(NMTVDISPINFOW* info) {
     auto config = GetConfig();
     std::wstring_view newName =
         NewNameFor(config->settings.navItems, config->effectiveMatch, text);
-    if (newName.empty()) {
+    if (newName.empty() || !buffer || buffer == LPSTR_TEXTCALLBACKW ||
+        cchBuffer <= 0) {
+        // Yeniden adlandırma yok ya da yazılabilecek bir tampon yok: öğe
+        // orijinal adıyla gösterilir.
         state->originalNames.erase(item.hItem);
         return;
     }
+    // text ebeveynin tamponunu (buffer olabilir) gösterir; üzerine yazmadan
+    // önce kopyalanır.
     state->originalNames[item.hItem] = std::wstring(text);
-    // Ebeveynin tamponuna yazmak yerine pszText kendi tamponumuza yönlendirilir
-    // (TVN_GETDISPINFO bunu destekler); ağaç metni hemen kopyalar/çizer.
-    state->dispText.assign(newName);
-    item.pszText = state->dispText.data();
+    std::wstring name(newName);
+    // Sığmazsa kesilir; StringCchCopyW her durumda sonlandırıcı yazar.
+    StringCchCopyW(buffer, static_cast<size_t>(cchBuffer), name.c_str());
+    item.pszText = buffer;
 }
 
 LRESULT CALLBACK ParentSubclassProc(HWND hwnd,
@@ -945,8 +1073,13 @@ LRESULT CALLBACK ParentSubclassProc(HWND hwnd,
         case WM_NOTIFY: {
             auto* hdr = reinterpret_cast<NMHDR*>(lParam);
             if (hdr && hdr->code == TVN_GETDISPINFOW) {
+                auto* info = reinterpret_cast<NMTVDISPINFOW*>(lParam);
+                // Ebeveyn pszText'i kendi belleğine yönlendirebilir; ağacın
+                // asıl tamponu önceden saklanır.
+                LPWSTR buffer = info->item.pszText;
+                int cchBuffer = info->item.cchTextMax;
                 LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
-                FixDispInfo(reinterpret_cast<NMTVDISPINFOW*>(lParam));
+                FixDispInfo(info, buffer, cchBuffer);
                 return result;
             }
             break;

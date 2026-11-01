@@ -144,7 +144,34 @@ static void test_incoming_text_real_change() {
     CHECK(u.display == L"Phone");
 }
 
+static void test_has_unresolved_clsid() {
+    // Varsayılan örnekte CLSID kuralı "S25+" adına çözülmüş.
+    CHECK(!HasUnresolvedClsid(SampleRules(), SampleMatch()));
+    auto match = SampleMatch();
+    match[1] = L"";
+    CHECK(HasUnresolvedClsid(SampleRules(), match));
+    // Boş isim kuralı CLSID değildir; yeniden denemeyi tetiklemez.
+    auto rules = SampleRules();
+    rules.push_back({L"", L"Renamed", false});
+    auto match2 = SampleMatch();
+    match2.push_back(L"");
+    CHECK(!HasUnresolvedClsid(rules, match2));
+    // effectiveMatch kısa kalmışsa eksik CLSID çözülmemiş sayılır.
+    CHECK(HasUnresolvedClsid(SampleRules(), {L"This PC"}));
+    CHECK(!HasUnresolvedClsid({}, {}));
+}
+
+static void test_retry_delay() {
+    CHECK(RetryDelay(10000, 4000, 5000) == 0);  // süre doldu
+    CHECK(RetryDelay(9000, 4000, 5000) == 0);   // tam sınırda
+    CHECK(RetryDelay(6000, 4000, 5000) == 3000);
+    CHECK(RetryDelay(4000, 4000, 5000) == 5000);
+    CHECK(RetryDelay(3000, 4000, 5000) == 5000);  // saat geride: bekle
+}
+
 int main() {
+    test_has_unresolved_clsid();
+    test_retry_delay();
     test_new_name_for();
     test_incoming_text_new_item();
     test_incoming_text_already_renamed();
