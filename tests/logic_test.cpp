@@ -337,7 +337,36 @@ static void test_hidden_targets() {
     CHECK(t.empty() && unresolved);
 }
 
+static void test_thread_record_stale() {
+    CHECK(!IsThreadRecordStale(true, true, 100, 100));   // aynı, canlı thread
+    CHECK(IsThreadRecordStale(false, false, 0, 100));    // id artık yok
+    CHECK(IsThreadRecordStale(true, false, 100, 100));   // çıkmış (tutamaç açık)
+    CHECK(IsThreadRecordStale(true, true, 200, 100));    // id yeniden kullanılmış
+}
+
+static void test_arm_diagnostics_drain() {
+    constexpr unsigned long long kQuiet = 200;
+    CHECK(!ShouldArmDiagnosticsDrain(true, false, 1000, 0, kQuiet));    // boş
+    CHECK(!ShouldArmDiagnosticsDrain(false, true, 1000, 0, kQuiet));    // kurulu
+    CHECK(!ShouldArmDiagnosticsDrain(false, false, 1100, 1000, kQuiet));  // dalga sürüyor
+    CHECK(ShouldArmDiagnosticsDrain(false, false, 1200, 1000, kQuiet));   // sınır
+    CHECK(ShouldArmDiagnosticsDrain(false, false, 5000, 1000, kQuiet));
+    CHECK(!ShouldArmDiagnosticsDrain(false, false, 500, 1000, kQuiet));   // saat geride
+}
+
+static void test_sort_unique() {
+    std::vector<unsigned long long> v{5, 1, 5, 3, 1, 1};
+    SortUnique(v);
+    CHECK((v == std::vector<unsigned long long>{1, 3, 5}));
+    std::vector<unsigned long long> empty;
+    SortUnique(empty);
+    CHECK(empty.empty());
+}
+
 int main() {
+    test_thread_record_stale();
+    test_arm_diagnostics_drain();
+    test_sort_unique();
     test_backup_list();
     test_backup_value();
     test_plan_hidden();

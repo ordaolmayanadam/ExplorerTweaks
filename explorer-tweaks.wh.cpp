@@ -393,6 +393,42 @@ std::vector<std::wstring> ComputeHiddenTargets(
     return targets;
 }
 
+// ----- XAML: thread kayıtları ve diagnostics referanslarının bırakılması -----
+
+// Bir XAML UI thread'i için tutulan kayıt artık sahipsiz mi? opened: thread id
+// ile açılabildi; stillActive: çıkış kodu STILL_ACTIVE; created: o id'deki
+// thread'in oluşturulma zamanı; recorded: kayıttaki zaman (farklıysa id başka
+// bir thread'e geçmiştir).
+inline bool IsThreadRecordStale(bool opened,
+                                bool stillActive,
+                                unsigned long long created,
+                                unsigned long long recorded) {
+    return !opened || !stillActive || created != recorded;
+}
+
+// Bekleyen diagnostics bırakmaları için boşaltma zamanlayıcısı şimdi kurulmalı
+// mı? Kuyruk boş değilse, zamanlayıcı zaten kurulu değilse ve son kuyruğa
+// eklemeden bu yana quietMs geçtiyse (bildirim dalgası bittiyse). Saat geride
+// görünürse beklenir.
+inline bool ShouldArmDiagnosticsDrain(bool pendingEmpty,
+                                      bool armed,
+                                      unsigned long long now,
+                                      unsigned long long lastQueued,
+                                      unsigned long long quietMs) {
+    if (pendingEmpty || armed || now < lastQueued) {
+        return false;
+    }
+    return now - lastQueued >= quietMs;
+}
+
+// Sıralar ve tekrarları atar (bir üst eleman her çocuğu için bir kez kuyruğa
+// girer).
+template <typename T>
+void SortUnique(std::vector<T>& values) {
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+}
+
 // ===== End Logic =====
 
 #ifndef ET_LOGIC_ONLY
@@ -1777,43 +1813,161 @@ struct XamlTarget {
     XamlKind kind;
 };
 
-// Bir XAML UI thread'inin durumu. İçerik yalnızca o thread'de okunur/yazılır;
-// harita yapısı g_collapsedMutex ile korunur. XAML'e dokunulurken kilit
-// tutulmaz (SetValue yeniden girişe yol açabilir): durum haritadan alınır
-// (TakeXamlState), işlenir ve geri konur (PutXamlState).
-struct XamlThreadState {
+// İzlenen adaylar ve yaptığımız değişiklikler. XAML'e dokunulurken (SetValue
+// yeniden girişe yol açabilir) thread durumundan alınır (TakeTracking),
+// işlenir ve geri konur (PutTracking).
+struct XamlTracking {
     std::vector<XamlTarget> targets;  // izlenen adaylar (ayardan bağımsız)
     std::vector<XamlChange> changes;  // yaptığımız ve geri alınacak değişiklikler
 };
 
-std::mutex g_collapsedMutex;
-std::unordered_map<DWORD, XamlThreadState> g_collapsed;  // thread id → durum
+// Bir XAML UI thread'inin durumu. İçerik yalnızca o thread'de okunur/yazılır;
+// başka bir thread yalnızca sahibi çıkmış (ya da id'si yeniden kullanılmış)
+// kayıtları haritadan düşürür ve bunu içeriğe dokunmadan, bilerek sızdırarak
+// yapar: XAML nesneleri sahibi olmayan thread'de serbest bırakılmamalıdır.
+// Harita yapısı g_collapsedMutex ile korunur.
+struct XamlThreadState {
+    unsigned long long created = 0;  // thread'in oluşturulma zamanı (FILETIME)
+    XamlTracking tracking;
+    // XAML Diagnostics'in bildirdiği elemanlara tuttuğu referansların bırakılma
+    // kuyruğu (bkz. QueueDiagnosticsRelease).
+    std::vector<InstanceHandle> pendingRelease;
+    unsigned long long lastQueued = 0;
+    bool drainArmed = false;
+    winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer drainTimer{nullptr};
+    winrt::event_token drainToken{};
+};
 
-XamlThreadState TakeXamlState() {
-    std::lock_guard<std::mutex> lock(g_collapsedMutex);
-    auto it = g_collapsed.find(GetCurrentThreadId());
-    if (it == g_collapsed.end()) {
-        return {};
-    }
-    XamlThreadState state = std::move(it->second);
-    g_collapsed.erase(it);
-    return state;
+std::mutex g_collapsedMutex;
+// thread id → durum. Adı brief'teki g_collapsed; önceki Visibility (ve diğer
+// yerel değerler) tracking.changes'te saklanır.
+std::unordered_map<DWORD, std::unique_ptr<XamlThreadState>> g_collapsed;
+// Bu thread'in g_collapsed'daki durumu (önbellek). Yalnızca sahibi thread
+// kendi kaydını siler ve bunu sıfırlar.
+thread_local XamlThreadState* t_xamlState = nullptr;
+
+// Wh_ModUninit'te true olur: OnVisualTreeChange ve boşaltma zamanlayıcısı
+// hiçbir şey yapmaz.
+std::atomic<bool> g_xamlStopping{false};
+// O anda mod kodunda çalışan XAML geri çağrısı sayısı (OnVisualTreeChange,
+// boşaltma zamanlayıcısı). Boşaltmadan önce sıfıra inmesi beklenir.
+std::atomic<int> g_xamlCallbacks{0};
+
+struct XamlInFlight {
+    XamlInFlight() { g_xamlCallbacks.fetch_add(1); }
+    ~XamlInFlight() { g_xamlCallbacks.fetch_sub(1); }
+    XamlInFlight(const XamlInFlight&) = delete;
+    XamlInFlight& operator=(const XamlInFlight&) = delete;
+};
+
+unsigned long long FileTimeValue(const FILETIME& ft) {
+    return (static_cast<unsigned long long>(ft.dwHighDateTime) << 32) |
+           ft.dwLowDateTime;
 }
 
-void PutXamlState(XamlThreadState state) {
-    if (state.targets.empty() && state.changes.empty()) {
+unsigned long long CurrentThreadCreationTime() {
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel,
+                        &user)) {
+        return 0;
+    }
+    return FileTimeValue(created);
+}
+
+// threadId'deki kayıt sahipsiz mi (thread çıkmış ya da id başka bir thread'e
+// geçmiş)?
+bool IsXamlThreadStale(DWORD threadId, unsigned long long recorded) {
+    HANDLE thread =
+        OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, threadId);
+    bool stillActive = false;
+    unsigned long long created = 0;
+    if (thread) {
+        DWORD exitCode = 0;
+        stillActive =
+            GetExitCodeThread(thread, &exitCode) && exitCode == STILL_ACTIVE;
+        FILETIME c, e, k, u;
+        if (GetThreadTimes(thread, &c, &e, &k, &u)) {
+            created = FileTimeValue(c);
+        }
+        CloseHandle(thread);
+    }
+    return IsThreadRecordStale(thread != nullptr, stillActive, created,
+                               recorded);
+}
+
+// Sahipsiz bir kaydı içeriğine dokunmadan bırakır (bilerek sızdırılır).
+void AbandonXamlState(std::unique_ptr<XamlThreadState> state) {
+    (void)state.release();
+}
+
+// Sahibi çıkmış kayıtları düşürür; g_collapsedMutex altında çağrılır.
+void PruneStaleXamlThreadsLocked() {
+    DWORD self = GetCurrentThreadId();
+    for (auto it = g_collapsed.begin(); it != g_collapsed.end();) {
+        if (it->first != self && IsXamlThreadStale(it->first, it->second->created)) {
+            AbandonXamlState(std::move(it->second));
+            it = g_collapsed.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Bu thread'in durumu; yoksa create ise oluşturulur (ve bu arada sahibi çıkmış
+// kayıtlar düşürülür), değilse nullptr.
+XamlThreadState* CurrentXamlState(bool create) {
+    if (t_xamlState || !create) {
+        return t_xamlState;
+    }
+    auto state = std::make_unique<XamlThreadState>();
+    state->created = CurrentThreadCreationTime();
+    XamlThreadState* raw = state.get();
+    std::lock_guard<std::mutex> lock(g_collapsedMutex);
+    auto& slot = g_collapsed[GetCurrentThreadId()];
+    if (slot) {
+        // Bu id'nin önceki sahibi çıkmış (bu thread'in önbelleği boştu).
+        AbandonXamlState(std::move(slot));
+    }
+    slot = std::move(state);
+    PruneStaleXamlThreadsLocked();
+    t_xamlState = raw;
+    return raw;
+}
+
+// Bu thread'in kaydını haritadan çıkarıp bu thread'de yok eder.
+void DestroyCurrentXamlState() {
+    std::unique_ptr<XamlThreadState> owned;
+    {
+        std::lock_guard<std::mutex> lock(g_collapsedMutex);
+        auto it = g_collapsed.find(GetCurrentThreadId());
+        if (it != g_collapsed.end() && it->second.get() == t_xamlState) {
+            owned = std::move(it->second);
+            g_collapsed.erase(it);
+        }
+    }
+    t_xamlState = nullptr;
+    // owned burada, sahibi olan thread'de serbest kalır.
+}
+
+XamlTracking TakeTracking() {
+    XamlThreadState* state = CurrentXamlState(false);
+    return state ? std::exchange(state->tracking, {}) : XamlTracking{};
+}
+
+void PutTracking(XamlTracking tracking) {
+    if (tracking.targets.empty() && tracking.changes.empty()) {
         return;
     }
-    std::lock_guard<std::mutex> lock(g_collapsedMutex);
-    XamlThreadState& slot = g_collapsed[GetCurrentThreadId()];
+    XamlThreadState* state = CurrentXamlState(true);
     // Arada (yeniden girişle) eklenenler daha yenidir; sona gelir.
-    state.targets.insert(state.targets.end(),
-                         std::make_move_iterator(slot.targets.begin()),
-                         std::make_move_iterator(slot.targets.end()));
-    state.changes.insert(state.changes.end(),
-                         std::make_move_iterator(slot.changes.begin()),
-                         std::make_move_iterator(slot.changes.end()));
-    slot = std::move(state);
+    XamlTracking& slot = state->tracking;
+    tracking.targets.insert(tracking.targets.end(),
+                            std::make_move_iterator(slot.targets.begin()),
+                            std::make_move_iterator(slot.targets.end()));
+    tracking.changes.insert(tracking.changes.end(),
+                            std::make_move_iterator(slot.changes.begin()),
+                            std::make_move_iterator(slot.changes.end()));
+    slot = std::move(tracking);
 }
 
 bool SameObject(const WinRtInspectable& a, const WinRtInspectable& b) {
@@ -1827,7 +1981,7 @@ bool HasThreadAccess(const wux::DependencyObject& obj) {
     return queue && queue.HasThreadAccess();
 }
 
-XamlChange* FindChange(XamlThreadState& state,
+XamlChange* FindChange(XamlTracking& state,
                        const wux::DependencyObject& obj,
                        const wux::DependencyProperty& dp) {
     for (XamlChange& change : state.changes) {
@@ -1840,7 +1994,7 @@ XamlChange* FindChange(XamlThreadState& state,
 
 // dp'ye value yazar. Önceki yerel değer yalnızca ilk yazımda kaydedilir; böylece
 // tekrar uygulamalar orijinali ezmez.
-void SetLocal(XamlThreadState& state,
+void SetLocal(XamlTracking& state,
               const wux::DependencyObject& obj,
               const wux::DependencyProperty& dp,
               const WinRtInspectable& value) {
@@ -1874,7 +2028,7 @@ void RestoreChange(const XamlChange& change) {
 }
 
 // obj.dp üzerindeki değişikliğimizi (varsa) geri alır ve kaydı siler.
-void RestoreLocal(XamlThreadState& state,
+void RestoreLocal(XamlTracking& state,
                   const wux::DependencyObject& obj,
                   const wux::DependencyProperty& dp) {
     for (auto it = state.changes.begin(); it != state.changes.end(); ++it) {
@@ -1889,7 +2043,7 @@ void RestoreLocal(XamlThreadState& state,
 
 // collapsed: Visibility=Collapsed yazılır (önceki değer g_collapsed'da
 // saklanır); değilse önceki değer geri konur.
-void SetCollapsed(XamlThreadState& state,
+void SetCollapsed(XamlTracking& state,
                   const wux::FrameworkElement& el,
                   bool collapsed) {
     const auto& dp = wux::UIElement::VisibilityProperty();
@@ -1901,7 +2055,7 @@ void SetCollapsed(XamlThreadState& state,
 }
 
 // Elemanı geçerli ayarlara getirir (gizler ya da geri alır).
-void ApplyXamlTarget(XamlThreadState& state,
+void ApplyXamlTarget(XamlTracking& state,
                      const wux::FrameworkElement& el,
                      XamlKind kind,
                      const Settings& s) {
@@ -1938,7 +2092,7 @@ void ApplyXamlTarget(XamlThreadState& state,
     }
 }
 
-void PruneDeadXaml(XamlThreadState& state) {
+void PruneDeadXaml(XamlTracking& state) {
     std::erase_if(state.targets,
                   [](const XamlTarget& t) { return !t.element.get(); });
     std::erase_if(state.changes,
@@ -1991,13 +2145,13 @@ void OnXamlTargetAdded(const wux::FrameworkElement& el, XamlKind kind) {
         !HasExplorerAncestor(el)) {
         return;
     }
-    XamlThreadState state = TakeXamlState();
-    if (state.targets.size() >= 32) {
-        PruneDeadXaml(state);
+    XamlTracking tracking = TakeTracking();
+    if (tracking.targets.size() >= 32) {
+        PruneDeadXaml(tracking);
     }
-    state.targets.push_back({winrt::make_weak(el), kind});
+    tracking.targets.push_back({winrt::make_weak(el), kind});
     try {
-        ApplyXamlTarget(state, el, kind, GetConfig()->settings);
+        ApplyXamlTarget(tracking, el, kind, GetConfig()->settings);
     } catch (...) {
         Wh_Log(L"XAML: applying to %s failed (0x%08X)",
                winrt::get_class_name(el).c_str(),
@@ -2005,35 +2159,147 @@ void OnXamlTargetAdded(const wux::FrameworkElement& el, XamlKind kind) {
     }
     Wh_Log(L"XAML: tracking %s (thread %u)", winrt::get_class_name(el).c_str(),
            GetCurrentThreadId());
-    PutXamlState(std::move(state));
+    PutTracking(std::move(tracking));
 }
 
 // Bu thread'in izlenen elemanlarını geçerli ayarlara getirir. Elemanların UI
 // thread'inde çağrılır.
 void ReapplyXamlForCurrentThread() {
-    XamlThreadState state = TakeXamlState();
-    PruneDeadXaml(state);
+    XamlTracking tracking = TakeTracking();
+    PruneDeadXaml(tracking);
     auto config = GetConfig();
-    for (const XamlTarget& target : state.targets) {
+    for (const XamlTarget& target : tracking.targets) {
         auto el = target.element.get();
         if (!el) {
             continue;
         }
         try {
-            ApplyXamlTarget(state, el, target.kind, config->settings);
+            ApplyXamlTarget(tracking, el, target.kind, config->settings);
         } catch (...) {
             Wh_Log(L"XAML: reapply failed (0x%08X)",
                    static_cast<unsigned>(winrt::to_hresult()));
         }
     }
-    PutXamlState(std::move(state));
+    PutTracking(std::move(tracking));
 }
 
-// Bu thread'deki bütün değişiklikleri (ters sırayla) geri alır ve durumu bu
-// thread'de serbest bırakır. Elemanların UI thread'inde çağrılır.
+// ----- Releasing XAML Diagnostics' element references -----
+// m417z'nin File Explorer Styler'ından uyarlanmıştır (GPL-3.0). XAML
+// Diagnostics bildirdiği her elemanı bir çalışma zamanı nesnesiyle tutar ve
+// ancak eleman "kaldırıldı" diye bildirilince bırakır. Bütünüyle atılan bir
+// ağaç (ör. kapanan bir pencerenin island'ı) hiç parçalanmadığı için hiç
+// kaldırma bildirmez; tutulan referanslar ağacın yok olmasını engeller ve
+// Explorer açık kaldıkça bellek büyür. Bu yüzden bildirilen her eleman (ve bir
+// eleman bildirilince nesnesi yeniden oluşturulan üst elemanı) kuyruğa alınır
+// ve IXamlDiagnosticsTestHooks::UnregisterInstance ile geri verilir.
+// Bizim izlediğimiz elemanlar kendi weak_ref'lerimizle tutulur; diagnostics
+// referansı bırakılsa da yaşamları Explorer'a bağlıdır.
+//
+// Bildirimler XAML'in kendi Enter/Leave yürüyüşlerinin içinden gelir; orada
+// referans bırakmak, yürüyüşün hâlâ ziyaret ettiği bir elemanı yok edebilir.
+// Bu yüzden kuyruk, bildirim dalgası durulduktan sonra (kDiagnosticsQuietMs)
+// thread'in dispatcher'ındaki tek atımlık bir zamanlayıcıyla boşaltılır.
+// Zamanlayıcı, kuyruğa yeni bir bildirim gelince kurulur (sürekli çalışan bir
+// zamanlayıcı yoktur); sessizleşen bir thread son dalgasını bir sonraki
+// bildirime kadar tutar. Dispatcher öğesi yerine zamanlayıcı kullanılır, çünkü
+// mod kaldırılırken durdurulabilir.
+
+// XamlDiagnostics bu arayüzü de uygular; xamlom.h bildirmez.
+static constexpr GUID IID_IXamlDiagnosticsTestHooks = {
+    0x735941a2,
+    0x3ee3,
+    0x495a,
+    {0x8d, 0xa9, 0x97, 0x26, 0x27, 0x00, 0x30, 0x75}};
+
+struct IXamlDiagnosticsTestHooks : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE
+    UnregisterInstance(InstanceHandle handle) = 0;
+    virtual HRESULT STDMETHODCALLTYPE
+    TryGetDispatcherQueueForObject(InstanceHandle handle,
+                                   void** dispatcherQueue) = 0;
+};
+
+// Bir ağaç kurulurken gelen bildirim dalgasını beklemeye yetecek kadar.
+constexpr unsigned long long kDiagnosticsQuietMs = 200;
+// Boşaltmayı yalnızca onu kuran bildirimin dışına taşımak için.
+constexpr auto kDiagnosticsDrainDelay = std::chrono::milliseconds{1};
+
+void DrainDiagnosticsReleases();
+
+void QueueDiagnosticsRelease(XamlThreadState& state, InstanceHandle handle) {
+    if (!handle) {
+        return;
+    }
+    state.pendingRelease.push_back(handle);
+    state.lastQueued = GetTickCount64();
+}
+
+// Kuyruk doluysa ve dalga durulduysa tek atımlık boşaltma zamanlayıcısını
+// kurar. Bildirimin içinden (elemanın UI thread'inde) çağrılır.
+void FlushDiagnosticsReleasesIfQuiet(XamlThreadState& state) {
+    if (!ShouldArmDiagnosticsDrain(state.pendingRelease.empty(),
+                                   state.drainArmed, GetTickCount64(),
+                                   state.lastQueued, kDiagnosticsQuietMs)) {
+        return;
+    }
+    try {
+        if (!state.drainTimer) {
+            auto queue = winrt::Microsoft::UI::Dispatching::DispatcherQueue::
+                GetForCurrentThread();
+            if (!queue) {
+                // Buradan (yürüyüşün içinden) bırakmak güvenli değil; elemanlar
+                // tutulmaya devam eder.
+                Wh_Log(L"XAML: no dispatcher queue on thread %u; elements stay "
+                       L"held",
+                       GetCurrentThreadId());
+                state.pendingRelease.clear();
+                return;
+            }
+            state.drainTimer = queue.CreateTimer();
+            state.drainTimer.IsRepeating(false);
+            state.drainTimer.Interval(kDiagnosticsDrainDelay);
+            state.drainToken = state.drainTimer.Tick(
+                [](const winrt::Microsoft::UI::Dispatching::
+                       DispatcherQueueTimer&,
+                   const WinRtInspectable&) { DrainDiagnosticsReleases(); });
+        }
+        state.drainTimer.Start();
+        state.drainArmed = true;
+    } catch (...) {
+        Wh_Log(L"XAML: arming the release drain failed (0x%08X)",
+               static_cast<unsigned>(winrt::to_hresult()));
+    }
+}
+
+// Zamanlayıcıyı durdurur, Tick işleyicisini kaldırır ve kuyruğu (bırakmadan)
+// atar; kuyruktakiler diagnostics'te tutulu kalır. Sahibi thread'de çağrılır.
+void StopDiagnosticsReleases(XamlThreadState& state) {
+    try {
+        if (state.drainTimer) {
+            state.drainTimer.Stop();
+            state.drainTimer.Tick(state.drainToken);
+            state.drainTimer = nullptr;
+        }
+    } catch (...) {
+        Wh_Log(L"XAML: stopping the release drain failed (0x%08X)",
+               static_cast<unsigned>(winrt::to_hresult()));
+    }
+    state.drainArmed = false;
+    state.pendingRelease.clear();
+}
+
+// Bu thread'deki bütün değişiklikleri (ters sırayla) geri alır, boşaltma
+// zamanlayıcısını durdurur ve durumu bu thread'de serbest bırakır.
+// Elemanların UI thread'inde çağrılır.
 void RestoreXamlForCurrentThread() {
-    XamlThreadState state = TakeXamlState();
-    for (auto it = state.changes.rbegin(); it != state.changes.rend(); ++it) {
+    XamlThreadState* state = CurrentXamlState(false);
+    if (!state) {
+        return;
+    }
+    StopDiagnosticsReleases(*state);
+    XamlTracking tracking = std::exchange(state->tracking, {});
+    for (auto it = tracking.changes.rbegin(); it != tracking.changes.rend();
+         ++it) {
         try {
             RestoreChange(*it);
         } catch (...) {
@@ -2041,6 +2307,7 @@ void RestoreXamlForCurrentThread() {
                    static_cast<unsigned>(winrt::to_hresult()));
         }
     }
+    DestroyCurrentXamlState();
 }
 
 struct ThreadWindowSearch {
@@ -2084,20 +2351,43 @@ HWND FindWindowOnThread(DWORD threadId) {
     return search.found;
 }
 
-// fn'i XAML durumu olan her UI thread'inde çalıştırır (kilit tutulmadan).
-// Ulaşılamayan thread sayısını döner.
+// threadId'nin kaydı hâlâ created ile oluşturulmuş kayıtsa ve sahibi çıkmışsa
+// kaydı sessizce düşürür (içeriği sızdırılır). Düşürüldüyse true.
+bool DropXamlThreadIfStale(DWORD threadId, unsigned long long created) {
+    if (!IsXamlThreadStale(threadId, created)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_collapsedMutex);
+    auto it = g_collapsed.find(threadId);
+    if (it != g_collapsed.end() && it->second->created == created) {
+        AbandonXamlState(std::move(it->second));
+        g_collapsed.erase(it);
+    }
+    return true;
+}
+
+// fn'i XAML durumu olan her canlı UI thread'inde çalıştırır (kilit
+// tutulmadan). Sahibi çıkmış kayıtlar sessizce düşürülür ve sayılmaz.
+// Canlı ama ulaşılamayan thread sayısını döner.
 int RunOnXamlThreads(void (*fn)()) {
-    std::vector<DWORD> threads;
+    std::vector<std::pair<DWORD, unsigned long long>> threads;
     {
         std::lock_guard<std::mutex> lock(g_collapsedMutex);
         for (const auto& entry : g_collapsed) {
-            threads.push_back(entry.first);
+            threads.emplace_back(entry.first, entry.second->created);
         }
     }
     int unreachable = 0;
-    for (DWORD threadId : threads) {
+    for (const auto& [threadId, created] : threads) {
+        if (DropXamlThreadIfStale(threadId, created)) {
+            continue;
+        }
         HWND hwnd = FindWindowOnThread(threadId);
         if (!hwnd || !RunOnWindowThread(hwnd, fn)) {
+            // Thread arada çıkmış olabilir; o durumda kayıt sessizce düşer.
+            if (DropXamlThreadIfStale(threadId, created)) {
+                continue;
+            }
             Wh_Log(L"XAML: could not reach UI thread %u", threadId);
             unreachable++;
         }
@@ -2109,18 +2399,22 @@ void ReapplyXaml() {
     RunOnXamlThreads(ReapplyXamlForCurrentThread);
 }
 
-// Bütün XAML değişikliklerini sahibi olan UI thread'lerinde geri alır (mod
-// kaldırılırken). Ulaşılamayan thread'lerin durumu bilerek sızdırılır: XAML
-// nesneleri (BindingExpression gibi) sahibi olmayan thread'de serbest
-// bırakılmamalı ve DLL boşaltılırken statik yıkıcıda kalmamalıdır.
+// Bütün XAML değişikliklerini sahibi olan UI thread'lerinde geri alır ve
+// boşaltma zamanlayıcılarını durdurur (mod kaldırılırken). Canlı ama
+// ulaşılamayan thread'lerin durumu bilerek sızdırılır: XAML nesneleri sahibi
+// olmayan thread'de serbest bırakılmamalı ve DLL boşaltılırken statik yıkıcıda
+// kalmamalıdır.
 void RestoreXaml() {
     RunOnXamlThreads(RestoreXamlForCurrentThread);
     std::lock_guard<std::mutex> lock(g_collapsedMutex);
     if (!g_collapsed.empty()) {
-        Wh_Log(L"XAML: %zu UI thread(s) not restored; their elements keep "
-               L"the hidden state",
+        Wh_Log(L"XAML: %zu live UI thread(s) not restored; their elements "
+               L"keep the hidden state and a release timer may remain "
+               L"(unsafe after unload)",
                g_collapsed.size());
-        new std::unordered_map<DWORD, XamlThreadState>(std::move(g_collapsed));
+        for (auto& entry : g_collapsed) {
+            AbandonXamlState(std::move(entry.second));
+        }
         g_collapsed.clear();
     }
 }
@@ -2136,19 +2430,22 @@ HMODULE GetCurrentModuleHandle() {
     return module;
 }
 
-// Wh_ModUninit'te true olur: OnVisualTreeChange hiçbir şey yapmaz.
-std::atomic<bool> g_xamlStopping{false};
-// O anda OnVisualTreeChange içinde olan çağrı sayısı (boşaltmadan önce sıfıra
-// inmesi beklenir).
-std::atomic<int> g_xamlCallbacks{0};
-
 class VisualTreeWatcher
     : public winrt::implements<VisualTreeWatcher,
                                IVisualTreeServiceCallback2,
                                winrt::non_agile> {
    public:
     explicit VisualTreeWatcher(winrt::com_ptr<IXamlDiagnostics> diag)
-        : m_diag(std::move(diag)) {}
+        : m_diag(std::move(diag)) {
+        HRESULT hr = m_diag->QueryInterface(IID_IXamlDiagnosticsTestHooks,
+                                            m_testHooks.put_void());
+        if (FAILED(hr)) {
+            Wh_Log(L"XAML: IXamlDiagnosticsTestHooks unavailable (0x%08X); "
+                   L"reported elements stay held by the diagnostics",
+                   static_cast<unsigned>(hr));
+            m_testHooks = nullptr;
+        }
+    }
 
     HRESULT Advise() {
         HRESULT hr =
@@ -2167,15 +2464,31 @@ class VisualTreeWatcher
             this);
     }
 
+    winrt::com_ptr<IXamlDiagnosticsTestHooks> TestHooks() const {
+        return m_testHooks;
+    }
+
     HRESULT STDMETHODCALLTYPE
-    OnVisualTreeChange(ParentChildRelation,
+    OnVisualTreeChange(ParentChildRelation relation,
                        VisualElement element,
                        VisualMutationType mutationType) override {
-        struct InFlight {
-            InFlight() { g_xamlCallbacks.fetch_add(1); }
-            ~InFlight() { g_xamlCallbacks.fetch_sub(1); }
-        } inFlight;
-        if (g_xamlStopping.load() || mutationType != Add) {
+        XamlInFlight inFlight;
+        if (g_xamlStopping.load()) {
+            return S_OK;
+        }
+        if (m_testHooks) {
+            // Bu bildirimin elemanını (ve eklemede, nesnesi yeniden oluşan üst
+            // elemanı) diagnostics'e geri vermek üzere kuyruğa al. Kuyruk,
+            // önceki dalga durulduysa önce boşaltılmaya kurulur.
+            if (XamlThreadState* state = CurrentXamlState(true)) {
+                FlushDiagnosticsReleasesIfQuiet(*state);
+                QueueDiagnosticsRelease(*state, element.Handle);
+                if (mutationType == Add) {
+                    QueueDiagnosticsRelease(*state, relation.Parent);
+                }
+            }
+        }
+        if (mutationType != Add) {
             return S_OK;
         }
         std::wstring_view type = element.Type ? element.Type : L"";
@@ -2209,11 +2522,52 @@ class VisualTreeWatcher
 
    private:
     winrt::com_ptr<IXamlDiagnostics> m_diag;
+    winrt::com_ptr<IXamlDiagnosticsTestHooks> m_testHooks;
     std::atomic<bool> m_advised{false};
 };
 
 std::mutex g_watcherMutex;
 winrt::com_ptr<VisualTreeWatcher> g_watcher;
+
+// Boşaltma zamanlayıcısının Tick'i: bu thread'in kuyruğunu (tekrarsız)
+// diagnostics'e geri verir. Dispatcher'dan, XAML yürüyüşünün dışında çalışır.
+void DrainDiagnosticsReleases() {
+    XamlInFlight inFlight;
+    XamlThreadState* state = CurrentXamlState(false);
+    if (!state) {
+        return;
+    }
+    state->drainArmed = false;
+    std::vector<InstanceHandle> pending = std::exchange(state->pendingRelease, {});
+    if (g_xamlStopping.load() || pending.empty()) {
+        return;
+    }
+    winrt::com_ptr<IXamlDiagnosticsTestHooks> hooks;
+    {
+        std::lock_guard<std::mutex> lock(g_watcherMutex);
+        if (g_watcher) {
+            hooks = g_watcher->TestHooks();
+        }
+    }
+    if (!hooks) {
+        return;
+    }
+    SortUnique(pending);
+    size_t failed = 0;
+    HRESULT lastError = S_OK;
+    for (InstanceHandle handle : pending) {
+        HRESULT hr = hooks->UnregisterInstance(handle);
+        if (FAILED(hr)) {
+            failed++;
+            lastError = hr;
+        }
+    }
+    if (failed) {
+        Wh_Log(L"XAML: UnregisterInstance failed for %zu of %zu (0x%08X)",
+               failed, pending.size(), static_cast<unsigned>(lastError));
+    }
+}
+
 // Bu DLL'in koduyla çalışan yardımcı thread'ler (advise ve enjeksiyon).
 // Boşaltmadan önce hepsinin bitmesi beklenir.
 std::vector<HANDLE> g_workerThreads;
@@ -2522,7 +2876,10 @@ void StopXaml() {
         Wh_Log(L"XAML: UnadviseVisualTreeChange: 0x%08X",
                static_cast<unsigned>(hr));
     }
-    // Unadvise öncesinde başlamış geri çağrılar.
+    // Unadvise öncesinde başlamış geri çağrılar (OnVisualTreeChange ve boşaltma
+    // zamanlayıcıları). Bundan sonra gelen Tick'ler g_xamlStopping yüzünden
+    // hiçbir şey yapmaz; zamanlayıcılar RestoreXaml'de kendi thread'lerinde
+    // durdurulur.
     for (int i = 0; i < 5000 && g_xamlCallbacks.load() > 0; i++) {
         Sleep(1);
     }
