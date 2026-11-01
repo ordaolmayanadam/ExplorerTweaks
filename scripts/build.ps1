@@ -30,7 +30,7 @@ try {
     }
 
     if ($Test) {
-        & $clang -x c++ -std=c++23 -target x86_64-w64-mingw32 -DUNICODE -D_UNICODE -static `
+        & $clang -x c++ -std=c++23 -target x86_64-w64-mingw32 -DUNICODE -D_UNICODE -Wall -Wextra -static `
             -o build\logic_test.exe tests\logic_test.cpp
         if ($LASTEXITCODE -ne 0) { Write-Host 'test build FAILED'; exit 1 }
         & (Join-Path $build 'logic_test.exe')
