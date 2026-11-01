@@ -1009,6 +1009,9 @@ struct TreeState {
     // Yeniden adlandırılmış kök çocuklarının orijinal adları (g_originalNames).
     // Yalnızca yeniden adlandırılan öğeler için kayıt vardır.
     std::unordered_map<HTREEITEM, std::wstring> originalNames;
+    // Pin ikonlarını kaldırırken ağaçtan alınan orijinal state image list.
+    // Sahibi CNscTree'dir; biz yalnızca geri koyarız, asla yok etmeyiz.
+    HIMAGELIST savedStateList = nullptr;
 };
 
 LRESULT CALLBACK TreeSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR,
@@ -1464,12 +1467,54 @@ void RetryClsidResolution(HWND tree) {
 LRESULT CALLBACK ParentSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR,
                                     DWORD_PTR);
 
+// Pin ikonlarını duruma göre kaldırır ya da geri koyar. Ağacın thread'inde
+// çağrılmalıdır (TVM_SETIMAGELIST başka thread'den gönderilmemeli).
+// hidePins açıkken: ağaçta state image list varsa çıkarılır ve TreeState'te
+// saklanır (öğelerin stateImg bitlerine dokunulmaz; pinli algılama sürer).
+// hidePins kapalıyken: saklı liste varsa ve ağaçta o arada yeni bir liste
+// kurulmamışsa geri konur. Saklı liste yoksa (ağaç, kanca listeyi bastırırken
+// açılmış) ikonlar pencere yeniden açılana kadar geri gelmez.
+void ApplyPinIcons(HWND tree) {
+    TreeState* state = GetTreeState(tree);
+    if (!state) {
+        return;
+    }
+    HIMAGELIST current = TreeView_GetImageList(tree, TVSIL_STATE);
+    if (GetConfig()->settings.hidePins) {
+        if (current) {
+            HIMAGELIST old = TreeView_SetImageList(tree, nullptr, TVSIL_STATE);
+            if (old) {
+                // En yenisi saklanır; öncekini sahibi zaten değiştirmiş olabilir.
+                state->savedStateList = old;
+            }
+        }
+        return;
+    }
+    if (state->savedStateList) {
+        if (!current) {
+            TreeView_SetImageList(tree, state->savedStateList, TVSIL_STATE);
+        }
+        state->savedStateList = nullptr;
+    } else if (!current) {
+        Wh_Log(L"ApplyPinIcons: tree %p has no state image list to restore; "
+               L"pin icons return when the window is reopened",
+               tree);
+    }
+}
+
 // Ağacın subclass'larını kaldırır, zamanlayıcısını öldürür ve durumunu serbest
-// bırakır. Ağacın thread'inde çağrılmalıdır.
-void DetachTree(HWND tree) {
+// bırakır. Ağacın thread'inde çağrılmalıdır. windowDestroyed, pencerenin
+// WM_NCDESTROY'unda true verilir: yok olan ağaca image list geri konmaz.
+void DetachTree(HWND tree, bool windowDestroyed = false) {
     KillTimer(tree, kTreeId);
     KillTimer(tree, kRetryTimerId);
     TreeState* state = GetTreeState(tree);
+    if (state && state->savedStateList && !windowDestroyed) {
+        if (!TreeView_GetImageList(tree, TVSIL_STATE)) {
+            TreeView_SetImageList(tree, state->savedStateList, TVSIL_STATE);
+        }
+        state->savedStateList = nullptr;
+    }
     RemoveWindowSubclass(tree, TreeSubclassProc, kTreeId);
     if (HWND parent = GetAncestor(tree, GA_PARENT)) {
         RemoveWindowSubclass(parent, ParentSubclassProc, kParentId);
@@ -1524,7 +1569,7 @@ LRESULT CALLBACK TreeSubclassProc(HWND hwnd,
             break;
 
         case WM_NCDESTROY:
-            DetachTree(hwnd);
+            DetachTree(hwnd, true);
             break;
     }
     return DefSubclassProc(hwnd, msg, wParam, lParam);
@@ -1677,6 +1722,45 @@ HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle,
     return hwnd;
 }
 
+// CNscTree::SetStateImageList (ExplorerFrame.dll): Quick Access pin ikonları
+// ağacın state image list'iyle çizilir. hidePins açıkken liste hiç kurulmaz.
+// x64'te tüm çağrı kuralları aynıdır; this işaretçisi void* alınır.
+using CNscTree_SetStateImageList_t = HRESULT (*)(void*, HIMAGELIST);
+CNscTree_SetStateImageList_t CNscTree_SetStateImageList_Original;
+
+HRESULT CNscTree_SetStateImageList_Hook(void* pThis, HIMAGELIST himl) {
+    if (GetConfig()->settings.hidePins) {
+        return S_OK;
+    }
+    return CNscTree_SetStateImageList_Original(pThis, himl);
+}
+
+// Sembol bulunamazsa ya da kancalanamazsa yalnızca açık ağaçlardaki listeler
+// kaldırılır; mod yüklenir.
+void HookPinIcons() {
+    HMODULE frame = GetModuleHandleW(L"ExplorerFrame.dll");
+    if (!frame) {
+        frame = LoadLibraryExW(L"ExplorerFrame.dll", nullptr,
+                               LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+    if (!frame) {
+        Wh_Log(L"pin hook unavailable (ExplorerFrame.dll not loaded)");
+        return;
+    }
+    WindhawkUtils::SYMBOL_HOOK hooks[] = {
+        {
+            {L"public: virtual long __cdecl "
+             L"CNscTree::SetStateImageList(struct _IMAGELIST *)"},
+            &CNscTree_SetStateImageList_Original,
+            CNscTree_SetStateImageList_Hook,
+            false,
+        },
+    };
+    if (!WindhawkUtils::HookSymbols(frame, hooks, ARRAYSIZE(hooks))) {
+        Wh_Log(L"pin hook unavailable");
+    }
+}
+
 // ===== Mod lifecycle =====
 
 BOOL Wh_ModInit() {
@@ -1686,6 +1770,7 @@ BOOL Wh_ModInit() {
                                         &CreateWindowExW_Original)) {
         Wh_Log(L"CreateWindowExW hook failed; only existing windows sorted");
     }
+    HookPinIcons();
     return TRUE;
 }
 
@@ -1695,6 +1780,7 @@ void Wh_ModAfterInit() {
     ForEachNavTree([](HWND tree) {
         RunOnWindowThread(tree, [tree] {
             AttachTree(tree);
+            ApplyPinIcons(tree);
             ReapplyNames(tree);
             ResortTree(tree);
         });
@@ -1723,6 +1809,7 @@ void Wh_ModSettingsChanged() {
             if (!GetTreeState(tree)) {
                 return;
             }
+            ApplyPinIcons(tree);
             ReapplyNames(tree);
             ResortTree(tree);
         });
