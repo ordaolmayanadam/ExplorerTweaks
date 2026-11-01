@@ -228,6 +228,156 @@ inline std::vector<int> ComputeOrder(
     return result;
 }
 
+// ----- Gizleme: yedek listesi ve yedek değeri -----
+
+// CLSID metninin ASCII büyük harfli hali. Windhawk storage anahtarları ve
+// yedek listesi hep bu biçimi kullanır, böylece büyük/küçük harf farkı aynı
+// CLSID'yi iki kayda bölmez.
+inline std::wstring NormalizeClsid(std::wstring_view s) {
+    std::wstring result(s);
+    for (wchar_t& c : result) {
+        if (c >= L'a' && c <= L'z') {
+            c = static_cast<wchar_t>(c - L'a' + L'A');
+        }
+    }
+    return result;
+}
+
+inline bool ContainsClsid(const std::vector<std::wstring>& list,
+                          std::wstring_view clsid) {
+    for (const std::wstring& item : list) {
+        if (NamesEqual(item, clsid)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// clsid CLSID biçimindeyse ve listede yoksa sona (normalleştirilmiş) ekler.
+inline bool AddToBackupList(std::vector<std::wstring>& list,
+                            std::wstring_view clsid) {
+    if (!IsClsidString(clsid) || ContainsClsid(list, clsid)) {
+        return false;
+    }
+    list.push_back(NormalizeClsid(clsid));
+    return true;
+}
+
+inline bool RemoveFromBackupList(std::vector<std::wstring>& list,
+                                 std::wstring_view clsid) {
+    for (auto it = list.begin(); it != list.end(); ++it) {
+        if (NamesEqual(*it, clsid)) {
+            list.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ";" ile ayrılmış CLSID'ler. CLSID olmayan ve boş parçalar atılır; tekrarlar
+// (büyük/küçük harf duyarsız) tek kayda iner, ilk görülme sırası korunur.
+inline std::vector<std::wstring> ParseBackupList(std::wstring_view text) {
+    std::vector<std::wstring> list;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t end = text.find(L';', pos);
+        if (end == std::wstring_view::npos) {
+            end = text.size();
+        }
+        AddToBackupList(list, text.substr(pos, end - pos));
+        pos = end + 1;
+    }
+    return list;
+}
+
+inline std::wstring SerializeBackupList(const std::vector<std::wstring>& list) {
+    std::wstring text;
+    for (const std::wstring& item : list) {
+        if (!text.empty()) {
+            text += L';';
+        }
+        text += item;
+    }
+    return text;
+}
+
+// Gizlemeden önceki System.IsPinnedToNameSpaceTree değeri: değer hiç yoktu
+// (absent) ya da bir DWORD'du.
+struct BackupValue {
+    bool absent = true;
+    DWORD value = 0;
+};
+
+inline std::wstring SerializeBackupValue(const BackupValue& v) {
+    return v.absent ? std::wstring(L"absent") : std::to_wstring(v.value);
+}
+
+// "absent" ya da işaretsiz ondalık DWORD (boşluk, işaret, önek yok).
+inline bool ParseBackupValue(std::wstring_view text, BackupValue& out) {
+    if (text == L"absent") {
+        out = {true, 0};
+        return true;
+    }
+    if (text.empty() || text.size() > 10) {
+        return false;
+    }
+    unsigned long long n = 0;
+    for (wchar_t c : text) {
+        if (c < L'0' || c > L'9') {
+            return false;
+        }
+        n = n * 10 + static_cast<unsigned long long>(c - L'0');
+    }
+    if (n > 0xFFFFFFFFull) {
+        return false;
+    }
+    out = {false, static_cast<DWORD>(n)};
+    return true;
+}
+
+struct HiddenPlan {
+    std::vector<std::wstring> hide;     // hedefte, yedeği yok: yedekle + gizle
+    std::vector<std::wstring> ensure;   // hedefte, yedeği var: gizli olduğunu doğrula
+    std::vector<std::wstring> restore;  // yedeği var, hedefte değil: geri yükle
+};
+
+// target: gizlenmesi istenen CLSID'ler; backups: yedek listesi.
+inline HiddenPlan PlanHidden(const std::vector<std::wstring>& target,
+                             const std::vector<std::wstring>& backups) {
+    HiddenPlan plan;
+    for (const std::wstring& clsid : target) {
+        (ContainsClsid(backups, clsid) ? plan.ensure : plan.hide)
+            .push_back(clsid);
+    }
+    for (const std::wstring& clsid : backups) {
+        if (!ContainsClsid(target, clsid)) {
+            plan.restore.push_back(clsid);
+        }
+    }
+    return plan;
+}
+
+// hidden: true olan kuralların CLSID'leri (normalleştirilmiş, tekilleştirilmiş,
+// kural sırasıyla). CLSID kuralları doğrudan, isim kuralları resolveName ile
+// (std::wstring(std::wstring_view); çözülemezse boş ya da CLSID olmayan döner)
+// CLSID'e çevrilir; çözülemeyenler atlanır.
+template <typename ResolveName>
+std::vector<std::wstring> ComputeHiddenTargets(
+    const std::vector<NavRule>& rules,
+    ResolveName&& resolveName) {
+    std::vector<std::wstring> targets;
+    for (const NavRule& rule : rules) {
+        if (!rule.hidden || rule.match.empty()) {
+            continue;
+        }
+        std::wstring clsid = IsClsidString(rule.match)
+                                 ? rule.match
+                                 : std::wstring(resolveName(rule.match));
+        AddToBackupList(targets, clsid);
+    }
+    return targets;
+}
+
 // ===== End Logic =====
 
 #ifndef ET_LOGIC_ONLY
@@ -392,6 +542,322 @@ void ReloadConfig() {
         old = std::exchange(g_config, std::move(config));
     }
     // Eski Config (son okuyucu bırakmadıysa) kilidin dışında serbest kalır.
+}
+
+// ===== Hiding =====
+// Gizleme, HKCU\Software\Classes\CLSID\{...} altındaki
+// System.IsPinnedToNameSpaceTree = 0 değeriyle yapılır (HKLM'ye dokunulmaz).
+// Orijinal değer, registry'ye yazmadan ÖNCE Windhawk storage'ına "backup/{CLSID}"
+// olarak yedeklenir; böylece araya giren bir çökme orijinal değeri kaybettirmez.
+// Storage numaralandırma sunmadığı için yedeği olan CLSID'ler "backupList"
+// değerinde ";" ile ayrılmış tutulur.
+
+constexpr wchar_t kPinnedValueName[] = L"System.IsPinnedToNameSpaceTree";
+constexpr wchar_t kBackupListName[] = L"backupList";
+// ~200 CLSID. Wh_GetStringValue sığmayan değerde boş döner; bu sınır pratikte
+// aşılmaz (kullanıcı birkaç öğe gizler).
+constexpr size_t kBackupListChars = 8192;
+constexpr size_t kBackupValueChars = 64;
+
+// Ayarlar ve Uninit farklı thread'lerden gizleme yapabilir; durum (storage +
+// registry) tek seferde bir thread'de değişir.
+std::mutex g_hiddenMutex;
+
+std::wstring ClsidKeyPath(std::wstring_view clsid) {
+    std::wstring path = L"Software\\Classes\\CLSID\\";
+    path.append(clsid);
+    return path;
+}
+
+std::wstring BackupValueName(std::wstring_view clsid) {
+    return L"backup/" + NormalizeClsid(clsid);
+}
+
+std::vector<std::wstring> LoadBackupList() {
+    std::vector<wchar_t> buf(kBackupListChars);
+    size_t n = Wh_GetStringValue(kBackupListName, buf.data(), buf.size());
+    return ParseBackupList(std::wstring_view(buf.data(), n));
+}
+
+bool SaveBackupList(const std::vector<std::wstring>& list) {
+    BOOL ok = list.empty()
+                  ? Wh_DeleteValue(kBackupListName)
+                  : Wh_SetStringValue(kBackupListName,
+                                      SerializeBackupList(list).c_str());
+    if (!ok) {
+        Wh_Log(L"SaveBackupList: storage write failed");
+    }
+    return ok != FALSE;
+}
+
+// Değerin o anki durumu. Anahtar ya da değer yoksa absent. Okunamazsa ya da
+// DWORD değilse false (neden loglanır); çağıran o CLSID'e dokunmaz.
+bool ReadPinnedValue(std::wstring_view clsid, BackupValue& out) {
+    std::wstring path = ClsidKeyPath(clsid);
+    HKEY key = nullptr;
+    LSTATUS rc = RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0,
+                               KEY_QUERY_VALUE, &key);
+    if (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND) {
+        out = {true, 0};
+        return true;
+    }
+    if (rc != ERROR_SUCCESS) {
+        Wh_Log(L"ReadPinnedValue: RegOpenKeyEx(%s) failed (%ld)", path.c_str(),
+               static_cast<long>(rc));
+        return false;
+    }
+    DWORD type = 0;
+    DWORD data = 0;
+    DWORD size = sizeof(data);
+    rc = RegQueryValueExW(key, kPinnedValueName, nullptr, &type,
+                          reinterpret_cast<BYTE*>(&data), &size);
+    RegCloseKey(key);
+    if (rc == ERROR_FILE_NOT_FOUND) {
+        out = {true, 0};
+        return true;
+    }
+    if (rc != ERROR_SUCCESS) {
+        Wh_Log(L"ReadPinnedValue: RegQueryValueEx(%s) failed (%ld)",
+               path.c_str(), static_cast<long>(rc));
+        return false;
+    }
+    if (type != REG_DWORD || size != sizeof(data)) {
+        Wh_Log(L"ReadPinnedValue: %s has unexpected type %lu; leaving it alone",
+               path.c_str(), static_cast<unsigned long>(type));
+        return false;
+    }
+    out = {false, data};
+    return true;
+}
+
+// Anahtar yoksa oluşturur.
+bool WritePinnedValue(std::wstring_view clsid, DWORD value) {
+    std::wstring path = ClsidKeyPath(clsid);
+    HKEY key = nullptr;
+    LSTATUS rc = RegCreateKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, nullptr,
+                                 0, KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (rc != ERROR_SUCCESS) {
+        Wh_Log(L"WritePinnedValue: RegCreateKeyEx(%s) failed (%ld)",
+               path.c_str(), static_cast<long>(rc));
+        return false;
+    }
+    rc = RegSetValueExW(key, kPinnedValueName, 0, REG_DWORD,
+                        reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(key);
+    if (rc != ERROR_SUCCESS) {
+        Wh_Log(L"WritePinnedValue: RegSetValueEx(%s) failed (%ld)",
+               path.c_str(), static_cast<long>(rc));
+        return false;
+    }
+    return true;
+}
+
+// Değeri siler; anahtara dokunmaz. Zaten yoksa başarılıdır.
+bool DeletePinnedValue(std::wstring_view clsid) {
+    std::wstring path = ClsidKeyPath(clsid);
+    HKEY key = nullptr;
+    LSTATUS rc = RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0,
+                               KEY_SET_VALUE, &key);
+    if (rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND) {
+        return true;
+    }
+    if (rc != ERROR_SUCCESS) {
+        Wh_Log(L"DeletePinnedValue: RegOpenKeyEx(%s) failed (%ld)",
+               path.c_str(), static_cast<long>(rc));
+        return false;
+    }
+    rc = RegDeleteValueW(key, kPinnedValueName);
+    RegCloseKey(key);
+    if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) {
+        Wh_Log(L"DeletePinnedValue: RegDeleteValue(%s) failed (%ld)",
+               path.c_str(), static_cast<long>(rc));
+        return false;
+    }
+    return true;
+}
+
+void AppendNamespaceClsids(HKEY root, std::vector<std::wstring>& out) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root,
+                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer"
+                      L"\\Desktop\\NameSpace",
+                      0, KEY_ENUMERATE_SUB_KEYS, &key) != ERROR_SUCCESS) {
+        return;
+    }
+    for (DWORD i = 0;; i++) {
+        wchar_t name[64];
+        DWORD len = ARRAYSIZE(name);
+        LSTATUS rc = RegEnumKeyExW(key, i, name, &len, nullptr, nullptr,
+                                   nullptr, nullptr);
+        if (rc == ERROR_NO_MORE_ITEMS) {
+            break;
+        }
+        if (rc == ERROR_MORE_DATA) {
+            continue;  // CLSID olamayacak kadar uzun
+        }
+        if (rc != ERROR_SUCCESS) {
+            Wh_Log(L"AppendNamespaceClsids: RegEnumKeyEx failed (%ld)",
+                   static_cast<long>(rc));
+            break;
+        }
+        AddToBackupList(out, name);  // CLSID olmayanları atar, tekilleştirir
+    }
+    RegCloseKey(key);
+}
+
+// Görünen adı name olan nav pane CLSID'i; bulunamazsa boş. Adaylar: bilinen
+// sabitler ile HKLM/HKCU Desktop\NameSpace alt anahtarları. COM başlatılmış
+// bir thread'de çağrılmalıdır.
+std::wstring FindClsidByName(std::wstring_view name) {
+    std::vector<std::wstring> candidates;
+    for (const wchar_t* known : {
+             L"{20D04FE0-3AEA-1069-A2D8-08002B30309D}",  // This PC
+             L"{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}",  // Network
+             L"{f874310e-b6b7-47dc-bc84-b9e6b38f5903}",  // Home
+             L"{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}",  // Gallery
+         }) {
+        AddToBackupList(candidates, known);
+    }
+    AppendNamespaceClsids(HKEY_LOCAL_MACHINE, candidates);
+    AppendNamespaceClsids(HKEY_CURRENT_USER, candidates);
+
+    for (const std::wstring& clsid : candidates) {
+        std::wstring resolved = ResolveClsidDisplayName(clsid);
+        if (!resolved.empty() && NamesEqual(resolved, name)) {
+            return clsid;
+        }
+    }
+    Wh_Log(L"FindClsidByName: no nav item named \"%.*s\"",
+           static_cast<int>(name.size()), name.data());
+    return L"";
+}
+
+// clsid'i yedekleyip gizler. Sıra: (1) mevcut değeri oku, (2) yedek değerini
+// yaz, (3) yedek listesine ekle, (4) registry'ye 0 yaz. Registry yazımı
+// başarısız olursa 2-3 geri alınır; böylece yedeği olmayan bir CLSID'in
+// "gizlenmiş" sayılması ya da başarısız yazım için yedek kalması olmaz.
+bool HideOne(const std::wstring& clsid) {
+    BackupValue original;
+    if (!ReadPinnedValue(clsid, original)) {
+        return false;
+    }
+    std::wstring name = BackupValueName(clsid);
+    if (!Wh_SetStringValue(name.c_str(),
+                           SerializeBackupValue(original).c_str())) {
+        Wh_Log(L"HideOne: backup write failed for %s; not hiding",
+               clsid.c_str());
+        return false;
+    }
+    std::vector<std::wstring> list = LoadBackupList();
+    AddToBackupList(list, clsid);
+    if (!SaveBackupList(list)) {
+        Wh_DeleteValue(name.c_str());
+        return false;
+    }
+    if (!WritePinnedValue(clsid, 0)) {
+        RemoveFromBackupList(list, clsid);
+        SaveBackupList(list);
+        Wh_DeleteValue(name.c_str());
+        return false;
+    }
+    Wh_Log(L"HideOne: hid %s (original %s)", clsid.c_str(),
+           SerializeBackupValue(original).c_str());
+    return true;
+}
+
+// Yedeği zaten olan bir CLSID'in hâlâ gizli (0) olduğunu doğrular, değilse
+// yeniden yazar (yedeğe dokunulmaz). Gizleme yazımı çöktüyse ya da değer
+// dışarıdan değiştiyse onarır. Registry'ye yazıldıysa true.
+bool EnsureHidden(const std::wstring& clsid) {
+    BackupValue current;
+    if (!ReadPinnedValue(clsid, current)) {
+        return false;
+    }
+    if (!current.absent && current.value == 0) {
+        return false;
+    }
+    if (!WritePinnedValue(clsid, 0)) {
+        return false;
+    }
+    Wh_Log(L"EnsureHidden: re-hid %s", clsid.c_str());
+    return true;
+}
+
+// Yedeği geri yazar ve yedek kaydını siler. Sıra: (1) registry'yi geri yaz,
+// (2) listeden çıkar, (3) yedek değerini sil; her adım arasında çökme sonraki
+// çalıştırmada aynı işlemi güvenle tekrarlatır. Geri yazım başarısızsa yedek
+// korunur (false). Registry değiştiyse changed true olur.
+bool RestoreOne(const std::wstring& clsid, bool& changed) {
+    std::wstring name = BackupValueName(clsid);
+    wchar_t buf[kBackupValueChars];
+    size_t n = Wh_GetStringValue(name.c_str(), buf, ARRAYSIZE(buf));
+    BackupValue backup;
+    bool valid = n != 0 && ParseBackupValue(std::wstring_view(buf, n), backup);
+
+    if (valid) {
+        bool ok = backup.absent ? DeletePinnedValue(clsid)
+                                : WritePinnedValue(clsid, backup.value);
+        if (!ok) {
+            return false;
+        }
+        changed = true;
+        Wh_Log(L"RestoreOne: restored %s (%s)", clsid.c_str(),
+               SerializeBackupValue(backup).c_str());
+    } else {
+        // Geri yüklenecek bir şey yok; kayıt takılı kalmasın diye düşülür.
+        Wh_Log(L"RestoreOne: no valid backup for %s; dropping entry",
+               clsid.c_str());
+    }
+
+    std::vector<std::wstring> list = LoadBackupList();
+    RemoveFromBackupList(list, clsid);
+    if (SaveBackupList(list)) {
+        Wh_DeleteValue(name.c_str());
+    }
+    return true;
+}
+
+void NotifyShellChanged() {
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+}
+
+// Ayarlardaki hidden: true kurallarını registry'ye uygular, kaldırılanları
+// geri yükler. Tekrar çağrılması zararsızdır (idempotent).
+void ApplyHidden() {
+    std::lock_guard<std::mutex> lock(g_hiddenMutex);
+    ComScope com;  // isim kuralları için kabuk çağrıları
+    auto config = GetConfig();
+
+    std::vector<std::wstring> target = ComputeHiddenTargets(
+        config->settings.navItems,
+        [](std::wstring_view name) { return FindClsidByName(name); });
+    HiddenPlan plan = PlanHidden(target, LoadBackupList());
+
+    bool changed = false;
+    for (const std::wstring& clsid : plan.hide) {
+        changed |= HideOne(clsid);
+    }
+    for (const std::wstring& clsid : plan.ensure) {
+        changed |= EnsureHidden(clsid);
+    }
+    for (const std::wstring& clsid : plan.restore) {
+        RestoreOne(clsid, changed);
+    }
+    if (changed) {
+        NotifyShellChanged();
+    }
+}
+
+// Bütün yedekleri geri yükler (mod kaldırılırken).
+void RestoreAllHidden() {
+    std::lock_guard<std::mutex> lock(g_hiddenMutex);
+    bool changed = false;
+    for (const std::wstring& clsid : LoadBackupList()) {
+        RestoreOne(clsid, changed);
+    }
+    if (changed) {
+        NotifyShellChanged();
+    }
 }
 
 // ===== Run on window thread =====
@@ -1175,6 +1641,7 @@ HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle,
 
 BOOL Wh_ModInit() {
     ReloadConfig();
+    ApplyHidden();
     if (!WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook,
                                         &CreateWindowExW_Original)) {
         Wh_Log(L"CreateWindowExW hook failed; only existing windows sorted");
@@ -1195,10 +1662,12 @@ void Wh_ModAfterInit() {
 }
 
 void Wh_ModUninit() {
+    RestoreAllHidden();
 }
 
 void Wh_ModSettingsChanged() {
     ReloadConfig();
+    ApplyHidden();
 
     // Bağlı tüm ağaçlar (Explorer pencereleri ve Explorer'ın barındırdığı
     // dosya diyalogları). Kopya kilit altında alınır, kilit RunOnWindowThread
