@@ -4,6 +4,7 @@
 // @description     Windows 11 File Explorer'ı sadeleştirir: tab satırı, toolbar, pin ikonları ve sol menü düzeni
 // @version         1.0.0
 // @author          omer
+// @license         GPL-3.0
 // @include         explorer.exe
 // @architecture    x86-64
 // @compilerOptions -lcomctl32 -lole32 -loleaut32 -lshlwapi -lruntimeobject
@@ -13,17 +14,50 @@
 /*
 # Explorer Tweaks
 
-Windows 11 File Explorer'ı sadeleştiren, tek başına çalışan bir mod.
+Windows 11 File Explorer'ı sadeleştiren, tek başına çalışan bir mod. Başka
+modlara bağlı değildir.
 
-- Tab satırını gizler.
-- Toolbar'ı (command bar) gizler.
-- Quick Access'teki pinli öğelerin pin ikonlarını kaldırır.
-- Sol menüyü (navigation pane) düzenler: sıralama, yeniden adlandırma,
-  gizleme ve pinli klasörlerin yeri.
+## Özellikler
 
-Tab, toolbar ve pin ikonu değişiklikleri yeni açılan pencerelerde etkili olur.
-Sol menü sırası ve adları açık pencerelere hemen uygulanır. Gizleme için
-Explorer'ı yeniden açmak gerekir.
+- **Tabları gizler.** Tab listesi ve "yeni sekme" düğmesi gizlenir; pencere
+  düğmeleri ve sürükleme alanı için boş bir başlık şeridi kalır.
+- **Toolbar'ı (command bar) gizler.**
+- **Pin ikonlarını kaldırır.** Quick Access'teki pinli öğelerin yanındaki
+  pin simgesi görünmez.
+- **Sol menüyü (navigation pane) düzenler:**
+  - Sıralama: `navItems` listesindeki sıra menüdeki sırayı belirler.
+  - Yeniden adlandırma: `newName` boş değilse öğe bu adla gösterilir.
+  - Gizleme: `hidden: true` olan öğeler menüden kaldırılır.
+  - Pinli klasörler en üste, en alta ya da Windows'un yerine konur.
+
+## Ayarlar
+
+`match` büyük/küçük harf duyarsız tam ad ya da `{CLSID}` olabilir. Listede
+olmayan öğeler listedekilerden sonra, kendi sıralarıyla gelir.
+
+Varsayılan ayardaki Phone CLSID'si (`{3611C374-...}`) **her bilgisayarda aynı
+olmayabilir**. Kendi öğenizin CLSID'sini şu kayıt defteri anahtarının altından
+bulabilirsiniz:
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace`
+Telefon eşleşmiyorsa o satırdaki `match` değerini kendi CLSID'nizle değiştirin
+(ya da öğenin görünen adını yazın).
+
+## Bilinen kısıtlar
+
+- Gizleme (`hidden`) kayıt defteri üzerinden yapılır; yeni açılan pencerelerde
+  görünür. Gerekirse Explorer'ı yeniden açın.
+- Tab satırı gizlenir ama sekmeler kapatılmaz: Ctrl+T hâlâ (görünmez) sekme
+  oluşturur.
+- Mod kapatılınca açık pencerelerde sol menünün eski sırası yenileyince
+  (F5) ya da pencereyi yeniden açınca geri gelir.
+- Tab ve toolbar gizleme yalnızca WinUI 3 tabanlı yeni Explorer sürümlerinde
+  çalışır.
+- Çözülemeyen CLSID kuralları (örneğin telefon bağlı değilken) otomatik olarak
+  yeniden denenir.
+- Kapsam dışı: Aç/Kaydet gibi başka uygulamaların pencereleri, sol menüye yeni
+  öğe eklemek, pinli öğelerin kendi aralarındaki sırası, Windows 10.
+
+Lisans: GPL-3.0.
 */
 // ==/WindhawkModReadme==
 
