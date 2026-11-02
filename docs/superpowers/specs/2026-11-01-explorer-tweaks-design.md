@@ -62,7 +62,7 @@ Proje tek bir dosyadan oluşur: `explorer-tweaks.wh.cpp`. Hedef süreç `explore
 |---|---|---|
 | Tabları gizle | XAML Diagnostics (`InitializeXamlDiagnosticsEx` + `IVisualTreeServiceCallback2`). `TabView` satırı `Visibility=Collapsed` yapılır, title bar yüksekliği ve caption alanı düzeltilir | Yeni pencerelerde |
 | Toolbar'ı gizle | Aynı XAML altyapısı: `FileExplorerExtensions.CommandBarControl` → `Collapsed` | Yeni pencerelerde |
-| Pin ikonlarını kaldır | `ExplorerFrame.dll` içinde `CNscTree::SetStateImageList` sembol hook'u. Ayar açıksa `S_OK` döner | Yeni pencerelerde |
+| Pin ikonlarını kaldır | Ağaç subclass'ı `TVM_SETIMAGELIST(TVSIL_STATE)` mesajını yakalar: ayar açıkken gelen liste saklanır, ağaca kurulmaz; kapanınca saklanan liste geri konur (2026-11-02 değişikliği; ilk tasarımdaki `CNscTree::SetStateImageList` sembol hook'u kaldırıldı) | Anında |
 | Sol menü: sıra, ad, pinlilerin yeri | Nav pane ağacının subclass'ı | Anında |
 | Sol menü: gizleme | `HKCU\Software\Classes\CLSID\{…}\System.IsPinnedToNameSpaceTree = 0`, yedekle ve geri yükle | Explorer yeniden açılınca |
 
@@ -83,6 +83,7 @@ Proje tek bir dosyadan oluşur: `explorer-tweaks.wh.cpp`. Hedef süreç `explore
     2. Pinli öğeler (state image = 1), `pinnedPosition` ayarına göre en başa ya da en sona konur. `default` seçiliyse pinliler yerinde kalır.
     3. Eşit anahtarlarda orijinal sıra korunur (kararlı sıralama). Sıralama öncesi her öğenin indeksi bir haritaya yazılır, eşitlikte bu indeks kullanılır.
   - Kendi sıralamamızın tetiklediği mesajlar yeniden sıralamaya yol açmasın diye yeniden giriş koruması (`g_sorting`) vardır.
+  - Sıralamadan sonra ağacın ilk görünür öğesi (`TVGN_FIRSTVISIBLE`) yeniden ayarlanır. Aksi halde comctl32 eski ilk öğeden çizmeye devam eder ve sol menü boş görünür (2026-11-02 çalışma zamanı bulgusu).
 - **Bilinen kısıt:** Mod kapatıldığında açık pencerelerin orijinal sırası ancak yenilenince (F5 veya pencereyi yeniden açma) geri gelir.
 
 ### 3.2 CLSID çözümleme
@@ -151,7 +152,7 @@ Ayar kuralları:
 ## 5. Hata durumları
 
 - Her parça bağımsızdır. Biri başlatılamazsa `Wh_Log` ile uyarı yazılır, diğerleri çalışmaya devam eder.
-- Sembol bulunamazsa (`CNscTree::SetStateImageList`) pin özelliği devre dışı kalır.
+- Pin ikonları sembol gerektirmez (ağaç subclass'ı); subclass kurulamazsa yalnızca o pencerede ikonlar kalır.
 - XAML Diagnostics başarısız olursa tab ve toolbar özellikleri devre dışı kalır.
 - Ağaçta beklenmeyen bir yapı görülürse (örn. kök bulunamazsa) sıralama yapılmaz.
 - Registry yazma hatası loglanır. Hatalı CLSID için yedek kaydı oluşturulmaz.
