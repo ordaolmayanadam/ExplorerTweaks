@@ -53,6 +53,51 @@ static void test_default_keeps_pinned_slots() {
                        PinnedPosition::Default) == (Order{0, 1, 3, 2, 4}));
 }
 
+// Pinli öğe listenin ortasındayken Default onu yerinde bırakır, diğerleri
+// kurala göre sıralanır (M7).
+static void test_default_pinned_mid_list() {
+    std::vector<NavEntry> entries = {{L"A", false}, {L"P", true}, {L"B", false}};
+    std::vector<NavRule> rules = {{L"B", L"", false}, {L"A", L"", false}};
+    std::vector<std::wstring> match = {L"B", L"A"};
+    CHECK(ComputeOrder(entries, rules, match, PinnedPosition::Default) ==
+          (Order{2, 1, 0}));
+    CHECK(ComputeOrder(entries, rules, match, PinnedPosition::Bottom) ==
+          (Order{2, 0, 1}));
+    CHECK(ComputeOrder(entries, rules, match, PinnedPosition::Top) ==
+          (Order{1, 2, 0}));
+}
+
+// Sıralamadan sonra ilk görünür öğe (F1: boş nav pane).
+static void test_first_visible_after_sort() {
+    const Order order{3, 2, 4, 0, 1};  // eski 3 yeni ilk çocuk
+    using K = TopItemKind;
+    // Görünüm en üstteydi (eski ilk çocuk): yeni ilk çocuk.
+    TopItem t = FirstVisibleAfterSort(order, {K::RootChild, 0});
+    CHECK(t.kind == K::RootChild && t.index == 3);
+    // İlk görünür öğe yoktu: yeni ilk çocuk.
+    t = FirstVisibleAfterSort(order, {K::None, -1});
+    CHECK(t.kind == K::RootChild && t.index == 3);
+    // Kök en üstteydi: kök kalır.
+    t = FirstVisibleAfterSort(order, {K::Root, -1});
+    CHECK(t.kind == K::Root);
+    // Kaydırılmıştı (başka bir kök çocuğu üstte): aynı öğe yeniden kurulur.
+    t = FirstVisibleAfterSort(order, {K::RootChild, 2});
+    CHECK(t.kind == K::RootChild && t.index == 2);
+    // Daha derin bir öğe üstteydi: aynı öğe (çağıran yeniden kurar).
+    t = FirstVisibleAfterSort(order, {K::Other, -1});
+    CHECK(t.kind == K::Other);
+    // Sıra değişmediyse en üstteki ilk çocuk aynı kalır.
+    t = FirstVisibleAfterSort(Order{0, 1, 2}, {K::RootChild, 0});
+    CHECK(t.kind == K::RootChild && t.index == 0);
+    // Geçersiz indeks ya da boş liste: dokunulmaz.
+    t = FirstVisibleAfterSort(order, {K::RootChild, 5});
+    CHECK(t.kind == K::None);
+    t = FirstVisibleAfterSort(order, {K::RootChild, -3});
+    CHECK(t.kind == K::None);
+    t = FirstVisibleAfterSort(Order{}, {K::None, -1});
+    CHECK(t.kind == K::None);
+}
+
 static void test_unlisted_after_listed() {
     auto entries = SampleEntries();
     entries.push_back({L"Network", false});
@@ -380,6 +425,8 @@ int main() {
     test_bottom();
     test_top();
     test_default_keeps_pinned_slots();
+    test_default_pinned_mid_list();
+    test_first_visible_after_sort();
     test_unlisted_after_listed();
     test_unresolved_rule_ignored();
     test_duplicate_and_empty_rules();

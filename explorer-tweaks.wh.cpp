@@ -265,6 +265,46 @@ inline std::vector<int> ComputeOrder(
     return result;
 }
 
+// Ağacın ilk görünür öğesi (TVGN_FIRSTVISIBLE): yok, gizli kök, kökün bir
+// çocuğu (index: o çocuğun sıralamadan önceki indeksi) ya da daha derin bir öğe.
+enum class TopItemKind { None, Root, RootChild, Other };
+
+struct TopItem {
+    TopItemKind kind = TopItemKind::None;
+    int index = -1;
+};
+
+// Kökün çocukları order'a (ComputeOrder sonucu: yeni konum → eski indeks) göre
+// sıralandıktan sonra ilk görünür yapılacak öğe. comctl32 sıralamada ilk
+// görünür öğeyi güncellemez; sıralamadan önceki ilk çocuk yerinde kalır ve
+// ağaç gezinene kadar boş çizilir. Görünüm en üstteyse (eski ilk çocuk ya da
+// hiç öğe yok) yeni ilk çocuk, kök en üstteyse kök, kaydırılmışsa aynı öğe
+// (comctl32 konumunu yeniden hesaplasın diye yeniden kurulur) döner. Geçersiz
+// girdide None: çağıran ilk görünür öğeye dokunmaz.
+inline TopItem FirstVisibleAfterSort(const std::vector<int>& order,
+                                     TopItem before) {
+    switch (before.kind) {
+        case TopItemKind::Root:
+        case TopItemKind::Other:
+            return before;
+        case TopItemKind::None:
+            if (order.empty()) {
+                return {};
+            }
+            return {TopItemKind::RootChild, order[0]};
+        case TopItemKind::RootChild:
+            if (before.index < 0 ||
+                static_cast<size_t>(before.index) >= order.size()) {
+                return {};
+            }
+            if (before.index == 0) {
+                return {TopItemKind::RootChild, order[0]};
+            }
+            return before;
+    }
+    return {};
+}
+
 // ----- Gizleme: yedek listesi ve yedek değeri -----
 
 // CLSID metninin ASCII büyük harfli hali. Windhawk storage anahtarları ve
@@ -1220,6 +1260,7 @@ void ResortTree(HWND tree) {
 
     std::vector<NavEntry> entries;
     std::vector<LPARAM> params;
+    std::vector<HTREEITEM> items;
     for (HTREEITEM item = TreeView_GetChild(tree, root); item;
          item = TreeView_GetNextSibling(tree, item)) {
         wchar_t text[MAX_PATH] = L"";
@@ -1240,6 +1281,7 @@ void ResortTree(HWND tree) {
             {std::wstring(OriginalName(state, item, TextOf(tvi.pszText))),
              pinned});
         params.push_back(tvi.lParam);
+        items.push_back(item);
     }
 
     auto config = GetConfig();
@@ -1267,11 +1309,48 @@ void ResortTree(HWND tree) {
         return;
     }
 
+    // comctl32 sıralamada ilk görünür öğeyi güncellemez: sıralamadan önceki
+    // ilk çocuk "ilk görünür" kalır ve ağaç bir gezinmeye kadar boş çizilir
+    // (RT4). Sıralamadan önce ilk görünür öğe alınır, sonra yeniden kurulur.
+    HTREEITEM top = TreeView_GetFirstVisible(tree);
+    TopItem before;
+    if (top == root) {
+        before = {TopItemKind::Root, -1};
+    } else if (top) {
+        before = {TopItemKind::Other, -1};
+        for (size_t i = 0; i < items.size(); i++) {
+            if (items[i] == top) {
+                before = {TopItemKind::RootChild, static_cast<int>(i)};
+                break;
+            }
+        }
+    }
+
     TVSORTCB sort{};
     sort.hParent = root;
     sort.lpfnCompare = CompareByTarget;
     sort.lParam = reinterpret_cast<LPARAM>(&target);
     SendMessageW(tree, TVM_SORTCHILDRENCB, 0, reinterpret_cast<LPARAM>(&sort));
+
+    TopItem after = FirstVisibleAfterSort(order, before);
+    HTREEITEM newTop = nullptr;
+    switch (after.kind) {
+        case TopItemKind::Root:
+            newTop = root;
+            break;
+        case TopItemKind::RootChild:
+            newTop = items[after.index];
+            break;
+        case TopItemKind::Other:
+            newTop = top;
+            break;
+        case TopItemKind::None:
+            break;
+    }
+    if (newTop && !TreeView_SelectSetFirstVisible(tree, newTop)) {
+        Wh_Log(L"ResortTree: resetting the first visible item failed");
+    }
+    InvalidateRect(tree, nullptr, TRUE);
 }
 
 // Kökün çocuklarının metnini geçerli kurallara göre yeni ada ya da (kural
