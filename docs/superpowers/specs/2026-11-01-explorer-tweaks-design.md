@@ -18,7 +18,7 @@ Hedef sol menü düzeni (varsayılan ayarlar):
 
 ```
 This PC
-Phone            (asıl adı: "Ömer Fatih adlı kişiye ait S25+")
+Phone            (asıl adı: "Ayşe adlı kişiye ait Telefon")
 Linux
 <pinli Quick Access klasörleri, düz liste>
 ```
@@ -38,7 +38,7 @@ Explorer'ın sol menüsü `SysTreeView32` üzerinde çalışan bir `CNscTree`'di
 ```
 (gizli kök: Desktop)
 ├─ Downloads, Documents, Pictures, Music, Videos, Recycle Bin, Google Drive (G:)   state image = 1 (pin)
-├─ Ömer Fatih adlı kişiye ait S25+                                                state image = 0
+├─ Ayşe adlı kişiye ait Telefon                                                state image = 0
 ├─ This PC                                                                        state image = 0
 └─ Linux                                                                          state image = 0
 ```
@@ -62,7 +62,7 @@ Proje tek bir dosyadan oluşur: `explorer-tweaks.wh.cpp`. Hedef süreç `explore
 |---|---|---|
 | Tabları gizle | XAML Diagnostics (`InitializeXamlDiagnosticsEx` + `IVisualTreeServiceCallback2`). `TabView` satırı `Visibility=Collapsed` yapılır, title bar yüksekliği ve caption alanı düzeltilir | Yeni pencerelerde |
 | Toolbar'ı gizle | Aynı XAML altyapısı: `FileExplorerExtensions.CommandBarControl` → `Collapsed` | Yeni pencerelerde |
-| Pin ikonlarını kaldır | `ExplorerFrame.dll` içinde `CNscTree::SetStateImageList` sembol hook'u. Ayar açıksa `S_OK` döner | Yeni pencerelerde |
+| Pin ikonlarını kaldır | Ağaç subclass'ı `TVM_SETIMAGELIST(TVSIL_STATE)` mesajını yakalar: ayar açıkken gelen liste saklanır, ağaca kurulmaz; kapanınca saklanan liste geri konur (2026-11-02 değişikliği; ilk tasarımdaki `CNscTree::SetStateImageList` sembol hook'u kaldırıldı) | Anında |
 | Sol menü: sıra, ad, pinlilerin yeri | Nav pane ağacının subclass'ı | Anında |
 | Sol menü: gizleme | `HKCU\Software\Classes\CLSID\{…}\System.IsPinnedToNameSpaceTree = 0`, yedekle ve geri yükle | Explorer yeniden açılınca |
 
@@ -83,6 +83,8 @@ Proje tek bir dosyadan oluşur: `explorer-tweaks.wh.cpp`. Hedef süreç `explore
     2. Pinli öğeler (state image = 1), `pinnedPosition` ayarına göre en başa ya da en sona konur. `default` seçiliyse pinliler yerinde kalır.
     3. Eşit anahtarlarda orijinal sıra korunur (kararlı sıralama). Sıralama öncesi her öğenin indeksi bir haritaya yazılır, eşitlikte bu indeks kullanılır.
   - Kendi sıralamamızın tetiklediği mesajlar yeniden sıralamaya yol açmasın diye yeniden giriş koruması (`g_sorting`) vardır.
+  - Sıralamadan hemen sonra öğe yüksekliği mevcut değerine yeniden ayarlanır (comctl32'yi öğe konumlarını yeniden hesaplamaya zorlar) ve ağacın ilk görünür öğesi (`TVGN_FIRSTVISIBLE`) yeniden kurulur. Ancak CNscTree sıralamadan sonra da ağaç işlemleri yapar (çocuk ekleme, `TVM_EXPAND`, `TVM_SELECTITEM`, `TVM_ENSUREVISIBLE`) ve comctl32'nin görünüm durumu yeniden bayatlar: ilk görünür öğe sıralama öncesi öğe (ör. "Downloads") kalır, dikey kaydırma aralığı 0 olur ve sol menü boş çizilir (2026-11-02 çalışma zamanı bulgusu).
+  - Bu yüzden sıralama gerçekten yapıldığında ağaç durumunda `reordered` işaretlenir ve ertelenmiş, kendini denetleyen bir görünüm onarımı (`FixTreeView`) kurulur: `TVM_INSERTITEMW`, `TVM_DELETEITEM`, `TVM_EXPAND`, `TVM_SELECTITEM`, `TVM_ENSUREVISIBLE`, `TVM_SORTCHILDREN`, `TVM_SORTCHILDRENCB` ve `TVM_SETITEMW` iletildikten sonra 150 ms'lik zamanlayıcı (`kViewFixTimerId`, debounce) yeniden kurulur; kendi işlemlerimiz sürerken (`g_sorting`) kurulmaz. Zamanlayıcı dolunca ağaç durulmuş sayılır ve denetlenir: kullanıcı kaydırdıysa (dikey kaydırma konumu > alt sınır) ya da ilk görünür öğe gizli kök / kökün ilk çocuğu ise (ya da öğe yoksa) hiçbir şey yapılmaz (`NeedsViewFix`). Aksi halde (yeniden çizim etkinse; `WS_VISIBLE` bitine bakılır) `WM_SETREDRAW` FALSE/TRUE gönderilerek comctl32'ye öğe konumları yeniden hesaplatılır (öğe yüksekliği değil), kökün ilk çocuğu ilk görünür yapılır ve ağaç yeniden çizilir; yeniden çizim kapalıysa (CNscTree toplu işlemde) seçim yapılmaz ve zamanlayıcı yeniden kurulur. `WM_SETREDRAW` zamanlayıcıyı yeniden kurmaz; ağaç başına bir kez günlüğe yazılır.
 - **Bilinen kısıt:** Mod kapatıldığında açık pencerelerin orijinal sırası ancak yenilenince (F5 veya pencereyi yeniden açma) geri gelir.
 
 ### 3.2 CLSID çözümleme
@@ -151,7 +153,7 @@ Ayar kuralları:
 ## 5. Hata durumları
 
 - Her parça bağımsızdır. Biri başlatılamazsa `Wh_Log` ile uyarı yazılır, diğerleri çalışmaya devam eder.
-- Sembol bulunamazsa (`CNscTree::SetStateImageList`) pin özelliği devre dışı kalır.
+- Pin ikonları sembol gerektirmez (ağaç subclass'ı); subclass kurulamazsa yalnızca o pencerede ikonlar kalır.
 - XAML Diagnostics başarısız olursa tab ve toolbar özellikleri devre dışı kalır.
 - Ağaçta beklenmeyen bir yapı görülürse (örn. kök bulunamazsa) sıralama yapılmaz.
 - Registry yazma hatası loglanır. Hatalı CLSID için yedek kaydı oluşturulmaz.

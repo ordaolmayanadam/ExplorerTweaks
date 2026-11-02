@@ -97,12 +97,12 @@
   - `int FindRule(const std::vector<NavRule>& rules, const std::vector<std::wstring>& effectiveMatch, std::wstring_view name);`: eşleşen ilk kuralın indeksini döner, yoksa -1. `effectiveMatch[i]` değeri kural i'nin isimle eşleşmesi için kullanılır: CLSID kurallarında çözülmüş ad, isim kurallarında `match`'in kendisi, çözülemeyende boş. Boş değerler hiçbir isimle eşleşmez.
   - `std::vector<int> ComputeOrder(const std::vector<NavEntry>& entries, const std::vector<NavRule>& rules, const std::vector<std::wstring>& effectiveMatch, PinnedPosition pos);`: `entries` için yeni sırayı orijinal indeksler cinsinden döner.
 
-- [ ] **Step 1:** `logic_test.cpp` içine şu testleri yaz. Örnek veri: entries = `[Downloads*, Documents*, S25+, This PC, Linux]` (`*` pinli), kurallar = `This PC`, `{3611…}`, `Linux`, `effectiveMatch` = `{L"This PC", L"S25+", L"Linux"}`.
+- [ ] **Step 1:** `logic_test.cpp` içine şu testleri yaz. Örnek veri: entries = `[Downloads*, Documents*, MyPhone, This PC, Linux]` (`*` pinli), kurallar = `This PC`, `{3611…}`, `Linux`, `effectiveMatch` = `{L"This PC", L"MyPhone", L"Linux"}`.
   - `test_bottom`: `ComputeOrder(..., Bottom)` sonucu `{3,2,4,0,1}`.
   - `test_top`: `Top` sonucu `{0,1,3,2,4}`.
   - `test_default_keeps_pinned_slots`: `Default` ile sonuç `{0,1,3,2,4}`. Pinliler 0 ve 1 numaralı yerlerinde kalır; pinli olmayanlar kalan yerlere kural sırasıyla yerleşir.
   - `test_unlisted_after_listed`: entries'e pinli olmayan `Network` (indeks 5) eklenir. `Bottom` ile sonuç `{3,2,4,5,0,1}`.
-  - `test_unresolved_rule_ignored`: `effectiveMatch[1] = L""` (telefon bağlı değil). `Bottom` ile sonuç `{3,4,2,0,1}`. S25+ listesiz sayılır ve listelilerden sonra gelir.
+  - `test_unresolved_rule_ignored`: `effectiveMatch[1] = L""` (telefon bağlı değil). `Bottom` ile sonuç `{3,4,2,0,1}`. MyPhone listesiz sayılır ve listelilerden sonra gelir.
   - `test_duplicate_and_empty_rules`: kurallara boş `match`'li bir kural ve ikinci bir `This PC` kuralı eklenir. `FindRule(..., L"this pc") == 0`, sonuç `test_bottom` ile aynı.
   - `test_is_clsid`: `IsClsidString(L"{3611C374-393E-41F8-98EB-1AD7BF051346}")` true, `IsClsidString(L"Linux")` false.
 - [ ] **Step 2:** `scripts/build.ps1 -Test` çalıştır. Beklenen: derleme hatası ya da FAIL (fonksiyonlar henüz yok).
@@ -150,8 +150,8 @@
   - `Wh_ModInit` içinde (ya da `Wh_ModAfterInit` varsa orada) `ForEachNavTree` ile `CabinetWClass` pencereleri `EnumWindows` + `EnumChildWindows` ile dolaşılır. Her ağaç için `RunOnWindowThread(tree, [&]{ AttachTree(tree); ResortTree(tree); })` çağrılır.
   - `Wh_ModSettingsChanged` içinde aynı şekilde ama yalnızca `ResortTree` çağrılır.
 - [ ] **Step 5:** `scripts/build.ps1 -Mod` çalıştır. Beklenen: çıkış kodu 0.
-- [ ] **Step 6:** İnsan adımı: kullanıcı modu Windhawk'ta derler. Ayarlarda `navItems[1].match` geçici olarak `Ömer Fatih adlı kişiye ait S25+` yapılır (CLSID çözümü Task 4'te gelecek). Ardından:
-  1. Mod derlenmeden önce açılmış bir pencerede şunu çalıştır: `tests/verify-navtree.ps1 -Expected 'This PC','Ömer Fatih adlı kişiye ait S25+','Linux' -Pinned bottom`. Beklenen: `PASS`.
+- [ ] **Step 6:** İnsan adımı: kullanıcı modu Windhawk'ta derler. Ayarlarda `navItems[1].match` geçici olarak `Ayşe adlı kişiye ait Telefon` yapılır (CLSID çözümü Task 4'te gelecek). Ardından:
+  1. Mod derlenmeden önce açılmış bir pencerede şunu çalıştır: `tests/verify-navtree.ps1 -Expected 'This PC','Ayşe adlı kişiye ait Telefon','Linux' -Pinned bottom`. Beklenen: `PASS`.
   2. Yeni bir pencerede aynısını çalıştır. Beklenen: `PASS`.
   3. Herhangi bir klasörü Quick Access'e pinle ve 1 saniye bekle, betiği tekrar çalıştır. Beklenen: `PASS` (yeni pin en altta).
   4. Pinlenen klasörü geri çöz.
