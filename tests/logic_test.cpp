@@ -406,7 +406,17 @@ static void test_sort_unique() {
     CHECK(empty.empty());
 }
 
+static void test_divider_color_override() {
+    auto on = DividerColorOverride(true, true);
+    CHECK(on.has_value());
+    CHECK(on.value_or(0) == RGB(0xF7, 0xF7, 0xF7));
+    CHECK(!DividerColorOverride(true, false).has_value());
+    CHECK(!DividerColorOverride(false, true).has_value());
+    CHECK(!DividerColorOverride(false, false).has_value());
+}
+
 int main() {
+    test_divider_color_override();
     test_thread_record_stale();
     test_sort_unique();
     test_backup_list();
