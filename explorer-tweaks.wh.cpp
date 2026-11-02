@@ -1361,7 +1361,7 @@ struct SortingGuard {
 
 // Yeniden sıralanmış bir ağaçta görünüm onarımını (yeniden) kurar (debounce).
 // Kendi işlemlerimiz (g_sorting) ve mod kaldırılırken kurulmaz; aksi halde
-// onarımın kendi TVM_SELECTITEM / TVM_SETITEMHEIGHT çağrıları sonsuza dek
+// onarımın kendi TVM_SELECTITEM / WM_SETREDRAW çağrıları sonsuza dek
 // yeniden kurardı.
 void ArmViewFix(HWND tree, const TreeState* state) {
     if (state && state->reordered && !g_sorting && !g_unloading.load()) {
@@ -1369,13 +1369,32 @@ void ArmViewFix(HWND tree, const TreeState* state) {
     }
 }
 
+// comctl32'ye öğe konumlarını yeniden hesaplatır: yeniden çizim kapatılıp
+// açılınca iç "gösterilen indeks" değerleri yeniden hesaplanır (öğe
+// yüksekliğini yeniden ayarlamak bunu yapmaz). WM_SETREDRAW(FALSE) WS_VISIBLE
+// bitini temizler; bit zaten temizse CNscTree bir toplu işlemin ortasındadır
+// (yeniden çizim kapalı) ve ona dokunmayız, aksi halde çizimi erken açardık.
+// Yeniden çizim etkinse FALSE/TRUE gönderir ve true döner. Ağacın thread'inde
+// çağrılmalıdır; WM_SETREDRAW zamanlayıcıyı yeniden kurmaz (alt sınıf
+// listesinde yok).
+bool RecomputeTreeLayout(HWND tree) {
+    if (!(GetWindowLongPtrW(tree, GWL_STYLE) & WS_VISIBLE)) {
+        return false;
+    }
+    SendMessageW(tree, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(tree, WM_SETREDRAW, TRUE, 0);
+    return true;
+}
+
 // Sıralamadan sonra CNscTree'nin ek ağaç işlemleri (çocuk ekleme, genişletme,
 // seçim) comctl32'nin görünüm durumunu yeniden bayatlatabilir: ilk görünür
 // öğe sıralama öncesi öğe kalır, kaydırma aralığı 0 olur ve sol menü boş
 // çizilir. Bu işlemler durulunca çalışır ve kendini denetler: kullanıcı
 // kaydırdıysa ya da ilk görünür öğe zaten kök / ilk çocuksa dokunmaz. Aksi
-// halde öğe yüksekliğini yeniden ayarlayıp (iç konumları yeniden hesaplatır)
-// ilk çocuğu ilk görünür yapar. Ağacın thread'inde çağrılmalıdır.
+// halde yeniden çizimi kapatıp açarak (iç konumları yeniden hesaplatır;
+// RecomputeTreeLayout) ilk çocuğu ilk görünür yapar. Yeniden çizim kapalıysa
+// (CNscTree toplu işlemde) seçim yapılmaz, zamanlayıcı yeniden kurulur.
+// Ağacın thread'inde çağrılmalıdır.
 void FixTreeView(HWND tree) {
     TreeState* state = GetTreeState(tree);
     if (!state || !state->reordered || g_unloading.load()) {
@@ -1400,9 +1419,10 @@ void FixTreeView(HWND tree) {
     }
 
     SortingGuard guard;
-    int height = TreeView_GetItemHeight(tree);
-    if (height > 0) {
-        TreeView_SetItemHeight(tree, height);
+    if (!RecomputeTreeLayout(tree)) {
+        // Yeniden çizim kapalı: CNscTree toplu işlemin ortasında. Sonra dene.
+        SetTimer(tree, kViewFixTimerId, kViewFixDelayMs, nullptr);
+        return;
     }
     if (!TreeView_SelectSetFirstVisible(tree, firstChild)) {
         Wh_Log(L"FixTreeView: resetting the first visible item failed");
@@ -1508,14 +1528,13 @@ void ResortTree(HWND tree) {
     }
 
     // comctl32, TVM_SORTCHILDRENCB sonrasında öğelerin iç "gösterilen indeks"
-    // değerlerini yeniden hesaplamaz. Geçerli öğe yüksekliğini yeniden
-    // ayarlamak bu hesaplamayı zorlar; aksi halde aşağıdaki ilk görünür öğe
-    // sıfırlaması etkisiz kalır ve sol menü boş çizilir. (Hemen yapılan bu
-    // onarım, sonraki işlemlerce bozulabilir; kalıcısı FixTreeView'dir.)
-    int height = TreeView_GetItemHeight(tree);
-    if (height > 0) {
-        TreeView_SetItemHeight(tree, height);
-    }
+    // değerlerini yeniden hesaplamaz. Yeniden çizimi kapatıp açmak bu
+    // hesaplamayı zorlar (RecomputeTreeLayout); aksi halde aşağıdaki ilk
+    // görünür öğe sıfırlaması etkisiz kalır ve sol menü boş çizilir. Yeniden
+    // çizim kapalıysa (CNscTree toplu işlemde) sıfırlama atlanır; ertelenmiş
+    // FixTreeView halleder. (Hemen yapılan bu onarım, sonraki işlemlerce
+    // bozulabilir; kalıcısı FixTreeView'dir.)
+    bool layoutRecomputed = RecomputeTreeLayout(tree);
 
     TopItem after = FirstVisibleAfterSort(order, before);
     HTREEITEM newTop = nullptr;
@@ -1532,7 +1551,8 @@ void ResortTree(HWND tree) {
         case TopItemKind::None:
             break;
     }
-    if (newTop && !TreeView_SelectSetFirstVisible(tree, newTop)) {
+    if (layoutRecomputed && newTop &&
+        !TreeView_SelectSetFirstVisible(tree, newTop)) {
         Wh_Log(L"ResortTree: resetting the first visible item failed");
     }
     InvalidateRect(tree, nullptr, TRUE);
