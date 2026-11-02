@@ -23,7 +23,8 @@ modlara bağlı değildir.
   düğmeleri ve sürükleme alanı için boş bir başlık şeridi kalır.
 - **Toolbar'ı (command bar) gizler.**
 - **Pin ikonlarını kaldırır.** Quick Access'teki pinli öğelerin yanındaki
-  pin simgesi görünmez.
+  pin simgesi görünmez. Ayar kapatılınca ikonlar açık pencerelerde de hemen
+  geri gelir.
 - **Sol menüyü (navigation pane) düzenler:**
   - Sıralama: `navItems` listesindeki sıra menüdeki sırayı belirler.
   - Yeniden adlandırma: `newName` boş değilse öğe bu adla gösterilir.
@@ -57,6 +58,10 @@ CLSID'nizle değiştirin (ya da öğenin görünen adını yazın).
   çalışır.
 - Çözülemeyen CLSID kuralları (örneğin telefon bağlı değilken) otomatik olarak
   yeniden denenir.
+- Windows'un kendi davranışı (mod kaynaklı değil): bazı sistemlerde bir
+  klasörün pini kaldırıldıktan sonra sol menüde Windows'un kendisi bir "Home"
+  öğesi gösterir ve yeni pinlenen bir klasör, Explorer yeniden başlatılana
+  kadar açık pencerelerde görünmeyebilir. Bu durum mod kapalıyken de olur.
 - Kapsam dışı: Aç/Kaydet gibi başka uygulamaların pencereleri, sol menüye yeni
   öğe eklemek, pinli öğelerin kendi aralarındaki sırası, Windows 10.
 

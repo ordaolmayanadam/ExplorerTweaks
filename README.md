@@ -6,14 +6,14 @@ Windows 11 File Explorer'ı sadeleştiren, tek başına çalışan bir [Windhawk
 
 - **Tab satırını gizler.** Tab listesi ve "yeni sekme" düğmesi gizlenir. Pencere düğmeleri (küçült/büyüt/kapat) ve sürükleme alanı çalışmaya devam etsin diye satır boş bir başlık şeridi olarak kalır.
 - **Toolbar'ı (command bar) gizler.**
-- **Pin ikonlarını kaldırır.** Quick Access'teki pinli öğelerin yanındaki pin simgesi görünmez.
+- **Pin ikonlarını kaldırır.** Quick Access'teki pinli öğelerin yanındaki pin simgesi görünmez. Ayar kapatılınca ikonlar açık pencerelerde de hemen geri gelir.
 - **Sol menüyü (navigation pane) düzenler:**
   - **Sıralama:** `navItems` listesindeki sıra, menüdeki sırayı belirler. Listede olmayan öğeler listedekilerden sonra, kendi sıralarıyla gelir.
   - **Yeniden adlandırma:** `newName` boş değilse öğe bu adla gösterilir (ör. "Ömer Fatih adlı kişiye ait S25+" yerine "Phone").
   - **Gizleme:** `hidden: true` olan öğeler menüden kaldırılır.
   - **Pinli klasörlerin yeri:** en üstte, en altta ya da Windows varsayılanı.
 
-Her özellik Windhawk ayar ekranından ayrı ayrı açılıp kapatılabilir. Sıra ve ad değişiklikleri açık pencerelere hemen uygulanır.
+Her özellik Windhawk ayar ekranından ayrı ayrı açılıp kapatılabilir. Sıra, ad ve pin ikonu değişiklikleri açık pencerelere hemen uygulanır.
 
 Varsayılan ayarlarla sol menü şöyle görünür:
 
@@ -96,15 +96,17 @@ Mod Windhawk'a yüklendikten sonra, açık bir Explorer penceresini dışarıdan
 
 | Betik | Ne denetler |
 |---|---|
-| `tests/verify-navtree.ps1` | Sol menü sırası, yeni adlar, pinlilerin yeri (`-Expected`, `-Pinned`, `-NoPinIcons`) |
+| `tests/verify-navtree.ps1` | Sol menü sırası, yeni adlar, pinlilerin yeri ve sol menünün boş çizilmediği (ilk görünür öğe) (`-Expected`, `-Exact`, `-Pinned`, `-NoPinIcons`, `-Hwnd`) |
 | `tests/verify-hidden.ps1` | Gizlenen öğenin `System.IsPinnedToNameSpaceTree` kayıt defteri değeri (`-Clsid`, `-Expect`) |
-| `tests/verify-xaml.ps1` | Tab satırı ve toolbar'ın gizlendiği (`-Check All\|Tabs\|CommandBar`) |
+| `tests/verify-xaml.ps1` | Tab satırı ve toolbar'ın gizlendiği, başlık çubuğunun adres satırıyla çakışmadığı (`-Check All\|Tabs\|CommandBar`) |
 
 Örnek:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File tests/verify-navtree.ps1 -Expected 'This PC','Phone','Linux' -Pinned bottom
+powershell -NoProfile -ExecutionPolicy Bypass -File tests/verify-navtree.ps1 -Expected 'This PC','Phone','Linux' -Pinned bottom -Exact
 ```
+
+`scripts/build.ps1 -Mod`, Windhawk'ın kendi derleme komutunu (mod kimliği ve sürümü, `windhawk.lib`, `@compilerOptions`) birebir kullanır.
 
 ## Bilinen kısıtlar
 
@@ -113,6 +115,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests/verify-navtree.ps1 -Ex
 - **Tab satırı gizlenir, tab özelliği kapanmaz.** Ctrl+T, "yeni sekmede aç" ve orta tuş tıklaması hâlâ sekme oluşturur; bu sekmeler görünmezdir. Tab satırı, pencere düğmeleri ve sürükleme alanı çalışsın diye boş bir başlık şeridi olarak kalır.
 - **Tab ve toolbar gizleme yalnızca WinUI 3 tabanlı yeni Explorer sürümlerinde** çalışır (XAML Diagnostics ile yapılır). Tab yoksa mod bu kısımda hiçbir şey yapmaz.
 - Phone CLSID'si kullanıcıya göre değişebilir (yukarıya bakın).
+- **Windows'un kendi davranışı (mod kaynaklı değil):** Bazı sistemlerde bir klasörün pini kaldırıldıktan sonra sol menüde Windows'un kendisi bir "Home" öğesi gösterir ve yeni pinlenen bir klasör, Explorer yeniden başlatılana kadar açık pencerelerde görünmeyebilir. Bu durum mod kapalıyken de olur.
 - **Kapsam dışı:** başka uygulamaların Aç/Kaydet pencereleri (`explorer.exe` dışında çalışırlar), sol menüye yeni öğe eklemek, pinli öğelerin kendi aralarındaki sırası, Windows 10.
 
 ## Lisans
