@@ -456,11 +456,36 @@ static void test_soft_selection_rect() {
     CHECK(narrow.top == 0 && narrow.bottom == 10);
 }
 
+static void test_header_theme_class() {
+    CHECK(IsHeaderThemeClass(L"Header"));
+    CHECK(IsHeaderThemeClass(L"header"));
+    CHECK(IsHeaderThemeClass(L"HEADER"));
+    CHECK(IsHeaderThemeClass(L"ItemsView::Header"));
+    CHECK(IsHeaderThemeClass(L"itemsview::header"));
+    CHECK(IsHeaderThemeClass(L"Foo;Header"));
+    CHECK(IsHeaderThemeClass(L"Header;Foo"));
+    CHECK(IsHeaderThemeClass(L"Foo;ItemsView::Header;Bar"));
+    CHECK(!IsHeaderThemeClass(L"HeaderX"));
+    CHECK(!IsHeaderThemeClass(L"XHeader"));
+    CHECK(!IsHeaderThemeClass(L"ItemsView::HeaderX"));
+    CHECK(!IsHeaderThemeClass(L"ListView"));
+    CHECK(!IsHeaderThemeClass(L"ItemsView"));
+    CHECK(!IsHeaderThemeClass(L""));
+    CHECK(!IsHeaderThemeClass(L";"));
+}
+
+static void test_header_underline_rect() {
+    RECT r = HeaderUnderlineRect({10, 20, 210, 72});
+    CHECK(r.left == 10 && r.right == 210 && r.top == 71 && r.bottom == 72);
+}
+
 int main() {
     test_divider_color_override();
     test_soft_selection_color();
     test_soft_selection_metrics();
     test_soft_selection_rect();
+    test_header_theme_class();
+    test_header_underline_rect();
     test_thread_record_stale();
     test_sort_unique();
     test_backup_list();

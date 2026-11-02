@@ -66,7 +66,7 @@ Proje tek bir dosyadan oluşur: `explorer-tweaks.wh.cpp`. Hedef süreç `explore
 | Sol menü: sıra, ad, pinlilerin yeri | Nav pane ağacının subclass'ı | Anında |
 | Sol menü: ayraç rengi (yalnızca açık tema) | `CNscTree::DrawDivider` (ExplorerFrame.dll) sembol hook'u thread-local bayrak kurar; `CreatePen` hook'u bayrak varken kalem rengini #F7F7F7 (dikey ayraçla aynı) yapar. Koyu temada Windows rengi kalır; tema `AppsUseLightTheme` değerinden okunur (2 sn önbellek) | Anında |
 | Sol menü: seçim/hover vurgusu (yalnızca açık tema) | Nav ağacının WM_PAINT/WM_PRINTCLIENT işlenmesi sürerken thread-local ağaç tutamacı kurulur; uxtheme `DrawThemeBackground(Ex)` hook'u TVP_TREEITEM'in hover/seçili durumlarında (TREIS_HOT, SELECTED, SELECTEDNOTFOCUS, HOTSELECTED) kenarlıksız, yuvarlak köşeli, yatayda içeri girintili ve daha soluk bir dolgu çizer. Koyu temada ve ağaç dışı çağrılarda orijinale geçer | Anında |
-| Sol menü: gizleme | `HKCU\Software\Classes\CLSID\{…}\System.IsPinnedToNameSpaceTree = 0`, yedekle ve geri yükle | Explorer yeniden açılınca |
+| Ayrıntılar görünümü: sütun başlığı alt çizgisi (yalnızca açık tema) | Dosya listesi DirectUI olduğundan SysHeader32 yoktur; başlık, \ `HKCU\Software\Classes\CLSID\{…}\System.IsPinnedToNameSpaceTree = 0`, yedekle ve geri yükle | Explorer yeniden açılınca |
 
 ### 3.1 Nav pane subclass
 
@@ -136,6 +136,9 @@ Proje tek bir dosyadan oluşur: `explorer-tweaks.wh.cpp`. Hedef süreç `explore
 - softSelection: true
   $name: Sol menü seçimini yumuşat
   $description: Açık temada sol menüdeki seçili/üzerine gelinen öğe arka planını daha soluk, kenarlıksız ve kenarlardan içeride çizer.
+- headerUnderline: true
+  $name: Sütun başlığının altına çizgi ekle
+  $description: Açık temada Ayrıntılar görünümündeki sütun başlıklarının altına, aralarındaki dikey çizgilerle aynı tipte ince bir çizgi çizer.
 - navItems:
   - - match: "This PC"
     - newName: ""

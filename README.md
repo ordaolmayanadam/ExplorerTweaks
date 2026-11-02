@@ -14,6 +14,7 @@ Windows 11 File Explorer'ı sadeleştiren, tek başına çalışan bir [Windhawk
   - **Pinli klasörlerin yeri:** en üstte, en altta ya da Windows varsayılanı.
   - **Ayraçları sadeleştirme:** yatay ayraçlar, sağdaki dikey ayraçla aynı renkte (#F7F7F7) çizilir. Yalnızca açık temada etkilidir; koyu temada Windows'un rengi kalır. Kalınlık ve kenar boşlukları değişmez.
   - **Seçimi yumuşatma:** açık temada seçili ya da üzerine gelinen öğenin arka planı daha soluk, kenarlıksız, yuvarlak köşeli ve kenarlardan içeride çizilir. Koyu temada Windows'un çizimi kalır.
+- **Sütun başlığının altına çizgi ekler.** Ayrıntılar görünümünde sütun başlıklarının altına, aralarındaki dikey çizgilerle aynı tipte (1 piksel, #E5E5E5) bir çizgi çizilir; çizgi yalnızca başlık öğelerinin altındadır, son sütunun sağ kenarında biter. Yalnızca açık temada etkilidir. Mod etkinleştirilmeden önce açılmış pencerelerde görünmesi için pencereyi yeniden açmak gerekebilir.
 
 Her özellik Windhawk ayar ekranından ayrı ayrı açılıp kapatılabilir. Sıra, ad ve pin ikonu değişiklikleri açık pencerelere hemen uygulanır.
 
@@ -48,6 +49,7 @@ Varsayılan ayarlar:
 | `pinnedPosition` | `bottom` | Pinli klasörlerin yeri: `default`, `top` ya da `bottom` |
 | `subtleDividers` | `true` | Sol menü ayraçlarını sadeleştir (yalnızca açık temada) |
 | `softSelection` | `true` | Sol menü seçimini yumuşat (yalnızca açık temada) |
+| `headerUnderline` | `true` | Sütun başlığının altına çizgi ekle (yalnızca açık temada) |
 | `navItems` | aşağıya bakın | Sol menü öğeleri |
 
 Varsayılan `navItems` listesi:
