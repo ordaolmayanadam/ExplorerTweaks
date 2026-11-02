@@ -98,6 +98,14 @@ static void test_first_visible_after_sort() {
     CHECK(t.kind == K::None);
 }
 
+// Ertelenmiş görünüm onarımı kararı.
+static void test_needs_view_fix() {
+    CHECK(NeedsViewFix(false, true, false));   // bayat ilk görünür öğe
+    CHECK(!NeedsViewFix(false, true, true));   // kök / ilk çocuk üstte
+    CHECK(!NeedsViewFix(true, true, false));   // kullanıcı kaydırmış
+    CHECK(!NeedsViewFix(false, false, false)); // öğe yok
+}
+
 static void test_unlisted_after_listed() {
     auto entries = SampleEntries();
     entries.push_back({L"Network", false});
@@ -416,6 +424,7 @@ int main() {
     test_default_keeps_pinned_slots();
     test_default_pinned_mid_list();
     test_first_visible_after_sort();
+    test_needs_view_fix();
     test_unlisted_after_listed();
     test_unresolved_rule_ignored();
     test_duplicate_and_empty_rules();

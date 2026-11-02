@@ -310,6 +310,14 @@ inline TopItem FirstVisibleAfterSort(const std::vector<int>& order,
     return {};
 }
 
+// Sıralamadan sonra ertelenmiş görünüm onarımı gerekli mi? comctl32'nin
+// görünüm durumu bayatladıysa ağacın ilk görünür öğesi (hasTop) gizli kök ya da
+// kökün ilk çocuğu (topIsAnchor) değildir, oysa kaydırma yoktur. Kullanıcı
+// kaydırdıysa (scrolled) ya da ilk görünür öğe yoksa dokunulmaz.
+inline bool NeedsViewFix(bool scrolled, bool hasTop, bool topIsAnchor) {
+    return !scrolled && hasTop && !topIsAnchor;
+}
+
 // ----- Gizleme: yedek listesi ve yedek değeri -----
 
 // CLSID metninin ASCII büyük harfli hali. Windhawk storage anahtarları ve
@@ -1223,6 +1231,10 @@ constexpr UINT_PTR kTreeId = 0xE7;    // ağaç subclass ve zamanlayıcı kimli�
 constexpr UINT_PTR kParentId = 0xE8;  // NamespaceTreeControl subclass kimliği
 constexpr UINT_PTR kRetryTimerId = 0xE9;  // ertelenmiş CLSID yeniden denemesi
 constexpr UINT kResortDelayMs = 50;
+// Sıralama sonrası görünüm onarımı zamanlayıcısı. Değer, comctl32 / CNscTree
+// zamanlayıcı kimlikleriyle çakışmasın diye ASCII "ETV3" seçildi.
+constexpr UINT_PTR kViewFixTimerId = 0x45545633;
+constexpr UINT kViewFixDelayMs = 150;
 
 // Ağaca gönderilir (PostMessage): adları yeniden uygula ve yeniden sırala.
 // Wh_ModInit'te kaydedilir.
@@ -1245,6 +1257,11 @@ struct TreeState {
     // state image list; ağaçta değil burada durur. Sahibi CNscTree'dir; biz
     // yalnızca geri koyarız, asla yok etmeyiz.
     HIMAGELIST savedStateList = nullptr;
+    // ResortTree bu ağaçta gerçekten TVM_SORTCHILDRENCB gönderdi. Bundan sonra
+    // CNscTree'nin ağaç işlemleri görünümü bayatlatabilir; bkz. FixTreeView.
+    bool reordered = false;
+    // FixTreeView'in bu ağaç için uygulandığı günlüğe yazıldı mı (bir kez).
+    bool viewFixLogged = false;
 };
 
 LRESULT CALLBACK TreeSubclassProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR,
@@ -1342,6 +1359,61 @@ struct SortingGuard {
     SortingGuard& operator=(const SortingGuard&) = delete;
 };
 
+// Yeniden sıralanmış bir ağaçta görünüm onarımını (yeniden) kurar (debounce).
+// Kendi işlemlerimiz (g_sorting) ve mod kaldırılırken kurulmaz; aksi halde
+// onarımın kendi TVM_SELECTITEM / TVM_SETITEMHEIGHT çağrıları sonsuza dek
+// yeniden kurardı.
+void ArmViewFix(HWND tree, const TreeState* state) {
+    if (state && state->reordered && !g_sorting && !g_unloading.load()) {
+        SetTimer(tree, kViewFixTimerId, kViewFixDelayMs, nullptr);
+    }
+}
+
+// Sıralamadan sonra CNscTree'nin ek ağaç işlemleri (çocuk ekleme, genişletme,
+// seçim) comctl32'nin görünüm durumunu yeniden bayatlatabilir: ilk görünür
+// öğe sıralama öncesi öğe kalır, kaydırma aralığı 0 olur ve sol menü boş
+// çizilir. Bu işlemler durulunca çalışır ve kendini denetler: kullanıcı
+// kaydırdıysa ya da ilk görünür öğe zaten kök / ilk çocuksa dokunmaz. Aksi
+// halde öğe yüksekliğini yeniden ayarlayıp (iç konumları yeniden hesaplatır)
+// ilk çocuğu ilk görünür yapar. Ağacın thread'inde çağrılmalıdır.
+void FixTreeView(HWND tree) {
+    TreeState* state = GetTreeState(tree);
+    if (!state || !state->reordered || g_unloading.load()) {
+        return;
+    }
+    HTREEITEM root = GetRootItem(tree);
+    if (!root) {
+        return;
+    }
+    HTREEITEM firstChild = TreeView_GetChild(tree, root);
+    HTREEITEM top = TreeView_GetFirstVisible(tree);
+
+    SCROLLINFO si{};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_POS | SIF_PAGE;
+    bool scrolled = GetScrollInfo(tree, SB_VERT, &si) && si.nPos > si.nMin;
+
+    if (!firstChild ||
+        !NeedsViewFix(scrolled, top != nullptr,
+                      top == root || top == firstChild)) {
+        return;
+    }
+
+    SortingGuard guard;
+    int height = TreeView_GetItemHeight(tree);
+    if (height > 0) {
+        TreeView_SetItemHeight(tree, height);
+    }
+    if (!TreeView_SelectSetFirstVisible(tree, firstChild)) {
+        Wh_Log(L"FixTreeView: resetting the first visible item failed");
+    }
+    InvalidateRect(tree, nullptr, TRUE);
+    if (!state->viewFixLogged) {
+        state->viewFixLogged = true;
+        Wh_Log(L"FixTreeView: repaired stale view of nav tree");
+    }
+}
+
 // Kökün çocuklarını ayarlara göre yeniden sıralar. Ağacın thread'inde
 // çağrılmalıdır. g_sorting yalnızca TVM_SORTCHILDRENCB değil tüm işlem boyunca
 // tutulur: callback metinli öğelerde TVM_GETITEMW ebeveyne TVN_GETDISPINFOW
@@ -1354,7 +1426,7 @@ void ResortTree(HWND tree) {
     if (!root) {
         return;
     }
-    const TreeState* state = GetTreeState(tree);
+    TreeState* state = GetTreeState(tree);
 
     std::vector<NavEntry> entries;
     std::vector<LPARAM> params;
@@ -1429,11 +1501,17 @@ void ResortTree(HWND tree) {
     sort.lpfnCompare = CompareByTarget;
     sort.lParam = reinterpret_cast<LPARAM>(&target);
     SendMessageW(tree, TVM_SORTCHILDRENCB, 0, reinterpret_cast<LPARAM>(&sort));
+    if (state) {
+        // Sıralamadan sonraki CNscTree işlemleri görünümü yeniden bayatlatabilir;
+        // ertelenmiş FixTreeView bunu denetler.
+        state->reordered = true;
+    }
 
     // comctl32, TVM_SORTCHILDRENCB sonrasında öğelerin iç "gösterilen indeks"
     // değerlerini yeniden hesaplamaz. Geçerli öğe yüksekliğini yeniden
     // ayarlamak bu hesaplamayı zorlar; aksi halde aşağıdaki ilk görünür öğe
-    // sıfırlaması etkisiz kalır ve sol menü boş çizilir.
+    // sıfırlaması etkisiz kalır ve sol menü boş çizilir. (Hemen yapılan bu
+    // onarım, sonraki işlemlerce bozulabilir; kalıcısı FixTreeView'dir.)
     int height = TreeView_GetItemHeight(tree);
     if (height > 0) {
         TreeView_SetItemHeight(tree, height);
@@ -1458,6 +1536,12 @@ void ResortTree(HWND tree) {
         Wh_Log(L"ResortTree: resetting the first visible item failed");
     }
     InvalidateRect(tree, nullptr, TRUE);
+
+    // ResortTree g_sorting altında çalıştığı için sıralama mesajı zamanlayıcıyı
+    // kurmadı; ilk onarım denetimi burada kurulur.
+    if (state && !g_unloading.load()) {
+        SetTimer(tree, kViewFixTimerId, kViewFixDelayMs, nullptr);
+    }
 }
 
 // Kökün çocuklarının metnini geçerli kurallara göre yeni ada ya da (kural
@@ -1820,6 +1904,7 @@ void ApplyPinIcons(HWND tree) {
 void DetachTree(HWND tree, bool windowDestroyed = false) {
     KillTimer(tree, kTreeId);
     KillTimer(tree, kRetryTimerId);
+    KillTimer(tree, kViewFixTimerId);
     TreeState* state = GetTreeState(tree);
     if (state && state->savedStateList && !windowDestroyed) {
         OwnStateListCall own;
@@ -1852,18 +1937,36 @@ LRESULT CALLBACK TreeSubclassProc(HWND hwnd,
     switch (msg) {
         case TVM_INSERTITEMW:
             if (lParam) {
-                return OnInsertItem(hwnd, state, wParam, lParam);
+                LRESULT result = OnInsertItem(hwnd, state, wParam, lParam);
+                ArmViewFix(hwnd, state);
+                return result;
             }
             break;
 
-        case TVM_DELETEITEM:
-            return OnDeleteItem(hwnd, state, wParam, lParam);
+        case TVM_DELETEITEM: {
+            LRESULT result = OnDeleteItem(hwnd, state, wParam, lParam);
+            ArmViewFix(hwnd, state);
+            return result;
+        }
 
         case TVM_SETITEMW:
             if (lParam) {
-                return OnSetItem(hwnd, state, wParam, lParam);
+                LRESULT result = OnSetItem(hwnd, state, wParam, lParam);
+                ArmViewFix(hwnd, state);
+                return result;
             }
             break;
+
+        // Sıralamadan sonra görünümü bayatlatabilen diğer ağaç işlemleri.
+        case TVM_EXPAND:
+        case TVM_SELECTITEM:
+        case TVM_ENSUREVISIBLE:
+        case TVM_SORTCHILDREN:
+        case TVM_SORTCHILDRENCB: {
+            LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
+            ArmViewFix(hwnd, state);
+            return result;
+        }
 
         case TVM_SETIMAGELIST:
             if (wParam == TVSIL_STATE && state && !t_ownStateListCall &&
@@ -1885,6 +1988,11 @@ LRESULT CALLBACK TreeSubclassProc(HWND hwnd,
             if (wParam == kRetryTimerId) {
                 KillTimer(hwnd, kRetryTimerId);
                 RetryClsidResolution(hwnd);
+                return 0;
+            }
+            if (wParam == kViewFixTimerId) {
+                KillTimer(hwnd, kViewFixTimerId);
+                FixTreeView(hwnd);
                 return 0;
             }
             break;
