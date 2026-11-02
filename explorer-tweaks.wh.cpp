@@ -33,6 +33,9 @@ modlara bağlı değildir.
   - Yatay ayraçlar sağdaki dikey ayraçla aynı renkte (#F7F7F7) çizilir
     (`subtleDividers`; yalnızca açık temada, koyu temada Windows'un rengi
     kalır).
+  - Seçili/üzerine gelinen öğenin arka planı açık temada daha soluk,
+    kenarlıksız, yuvarlak köşeli ve kenarlardan içeride çizilir
+    (`softSelection`; koyu temada Windows'un çizimi kalır).
 
 ## Ayarlar
 
@@ -89,6 +92,9 @@ Lisans: GPL-3.0.
 - subtleDividers: true
   $name: Sol menü ayraçlarını sadeleştir
   $description: Yatay ayraçları sağdaki dikey ayraçla aynı renkte (açık temada) çizer.
+- softSelection: true
+  $name: Sol menü seçimini yumuşat
+  $description: Açık temada sol menüdeki seçili/üzerine gelinen öğe arka planını daha soluk, kenarlıksız ve kenarlardan içeride çizer.
 - navItems:
   - - match: "This PC"
     - newName: ""
@@ -523,12 +529,75 @@ inline std::optional<COLORREF> DividerColorOverride(bool enabled,
     return RGB(0xF7, 0xF7, 0xF7);
 }
 
+// ----- Sol menü seçim/hover vurgusu -----
+
+// uxtheme TreeView parçası ve durumları (vsstyle.h: TVP_TREEITEM, TREIS_*).
+// Mantık bölümü Windhawk/SDK başlıklarına bağlı olmasın diye burada tekrarlanır.
+constexpr int kTvpTreeItem = 1;
+constexpr int kTreisHot = 2;
+constexpr int kTreisSelected = 3;
+constexpr int kTreisSelectedNotFocus = 5;
+constexpr int kTreisHotSelected = 6;
+
+// Yumuşatılmış vurgunun dolgu rengi: ayar açık, tema açık ve parça/durum
+// TVP_TREEITEM'in hover/seçili durumlarından biriyse renk, aksi halde nullopt
+// (Windows'un kendi çizimi kalır).
+inline std::optional<COLORREF> SoftSelectionColor(bool enabled,
+                                                  bool lightTheme,
+                                                  int partId,
+                                                  int stateId) {
+    if (!enabled || !lightTheme || partId != kTvpTreeItem) {
+        return std::nullopt;
+    }
+    switch (stateId) {
+        case kTreisHot:
+            return RGB(0xEE, 0xF5, 0xFC);
+        case kTreisSelected:
+            return RGB(0xE1, 0xEE, 0xFB);
+        case kTreisSelectedNotFocus:
+            return RGB(0xED, 0xED, 0xED);
+        case kTreisHotSelected:
+            return RGB(0xD9, 0xE8, 0xF8);
+        default:
+            return std::nullopt;
+    }
+}
+
+// 96 DPI'a göre verilen piksel değerinin dpi'ya ölçeklenmiş hali.
+inline int SoftSelectionScale(int pixelsAt96, int dpi) {
+    return MulDiv(pixelsAt96, dpi > 0 ? dpi : 96, 96);
+}
+
+// Vurgunun bölme kenarlarından yatay içeri girintisi.
+inline int SoftSelectionInset(int dpi) {
+    return SoftSelectionScale(6, dpi);
+}
+
+// Köşe yarıçapı.
+inline int SoftSelectionRadius(int dpi) {
+    return SoftSelectionScale(4, dpi);
+}
+
+// Çizilecek dikdörtgen: yatayda girintili, dikey değişmez. Çok dar
+// dikdörtgen ters dönmez (genişlik 0'a iner).
+inline RECT SoftSelectionRect(const RECT& rect, int dpi) {
+    int inset = SoftSelectionInset(dpi);
+    RECT result = rect;
+    result.left += inset;
+    result.right -= inset;
+    if (result.right < result.left) {
+        result.left = result.right = rect.left + (rect.right - rect.left) / 2;
+    }
+    return result;
+}
+
 // ===== End Logic =====
 
 #ifndef ET_LOGIC_ONLY
 
 #include <commctrl.h>
 #include <ocidl.h>
+#include <uxtheme.h>
 #include <shlobj.h>
 #include <unknwn.h>
 #include <xamlom.h>
@@ -594,6 +663,7 @@ struct Settings {
     bool hidePins = true;
     PinnedPosition pinnedPosition = PinnedPosition::Bottom;
     bool subtleDividers = true;
+    bool softSelection = true;
     std::vector<NavRule> navItems;
 };
 
@@ -628,6 +698,7 @@ Settings LoadSettings() {
     s.hideCommandBar = Wh_GetIntSetting(L"hideCommandBar") != 0;
     s.hidePins = Wh_GetIntSetting(L"hidePins") != 0;
     s.subtleDividers = Wh_GetIntSetting(L"subtleDividers") != 0;
+    s.softSelection = Wh_GetIntSetting(L"softSelection") != 0;
 
     PCWSTR pos = Wh_GetStringSetting(L"pinnedPosition");
     if (pos && wcscmp(pos, L"top") == 0) {
@@ -1897,6 +1968,22 @@ struct OwnStateListCall {
     OwnStateListCall& operator=(const OwnStateListCall&) = delete;
 };
 
+// ----- Sol menü seçim vurgusu -----
+// Vurguyu comctl32'nin temalı TreeView'i uxtheme DrawThemeBackground ile
+// çizer. Kanca (bkz. HookSoftSelection) yalnızca nav ağacının WM_PAINT /
+// WM_PRINTCLIENT işlenirken müdahale eder; hangi ağacın boyandığı burada
+// thread-local olarak tutulur.
+
+thread_local HWND t_paintingTree = nullptr;
+
+struct PaintingTreeScope {
+    HWND previous = t_paintingTree;
+    explicit PaintingTreeScope(HWND tree) { t_paintingTree = tree; }
+    ~PaintingTreeScope() { t_paintingTree = previous; }
+    PaintingTreeScope(const PaintingTreeScope&) = delete;
+    PaintingTreeScope& operator=(const PaintingTreeScope&) = delete;
+};
+
 // Subclass'tan, hidePins açıkken gelen TVM_SETIMAGELIST(TVSIL_STATE) için.
 // incoming saklanır, ağaçta liste varsa (bağlanmadan önce kurulmuş) çıkarılır;
 // dönen değer ağacın vereceği "önceki liste"dir (CNscTree onu yok edebilir).
@@ -2037,6 +2124,13 @@ LRESULT CALLBACK TreeSubclassProc(HWND hwnd,
                 return 0;
             }
             break;
+
+        // Vurgu kancası yalnızca bu çağrılar sürerken müdahale eder.
+        case WM_PAINT:
+        case WM_PRINTCLIENT: {
+            PaintingTreeScope paintScope(hwnd);
+            return DefSubclassProc(hwnd, msg, wParam, lParam);
+        }
 
         case WM_NCDESTROY:
             DetachTree(hwnd, true);
@@ -3695,6 +3789,126 @@ void HookDividers() {
     }
 }
 
+// ----- Sol menü seçim vurgusu: kancalar -----
+// TreeView öğe vurgusu uxtheme'in DrawThemeBackground(Ex) çağrısıyla çizilir
+// (TVP_TREEITEM). Yalnızca nav ağacı boyanırken (t_paintingTree), ayar açık ve
+// tema açıkken, hover/seçili durumlarında yerine yumuşak bir yuvarlak dikdörtgen
+// çizilir; diğer her şey doğrudan orijinale geçer.
+
+// Müdahale edilecek çağrıysa kendi vurgumuzu çizer ve true döner. clipRect
+// null olabilir.
+bool DrawSoftSelection(HDC hdc,
+                       int partId,
+                       int stateId,
+                       const RECT* rect,
+                       const RECT* clipRect) {
+    if (!t_paintingTree || !hdc || !rect || g_unloading.load()) {
+        return false;
+    }
+    auto color = SoftSelectionColor(GetConfig()->settings.softSelection,
+                                    IsLightTheme(), partId, stateId);
+    if (!color) {
+        return false;
+    }
+    int dpi = static_cast<int>(GetDpiForWindow(t_paintingTree));
+    RECT fill = SoftSelectionRect(*rect, dpi);
+    int diameter = 2 * SoftSelectionRadius(dpi);
+
+    int saved = SaveDC(hdc);
+    if (clipRect) {
+        IntersectClipRect(hdc, clipRect->left, clipRect->top, clipRect->right,
+                          clipRect->bottom);
+    }
+    HBRUSH brush = CreateSolidBrush(*color);
+    HPEN pen = CreatePen(PS_SOLID, 1, *color);
+    if (brush && pen) {
+        HGDIOBJ oldBrush = SelectObject(hdc, brush);
+        HGDIOBJ oldPen = SelectObject(hdc, pen);
+        RoundRect(hdc, fill.left, fill.top, fill.right, fill.bottom, diameter,
+                  diameter);
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+    }
+    if (pen) {
+        DeleteObject(pen);
+    }
+    if (brush) {
+        DeleteObject(brush);
+    }
+    if (saved) {
+        RestoreDC(hdc, saved);
+    }
+    return brush && pen;
+}
+
+using DrawThemeBackground_t = decltype(&DrawThemeBackground);
+DrawThemeBackground_t DrawThemeBackground_Original;
+
+HRESULT WINAPI DrawThemeBackground_Hook(HTHEME theme,
+                                        HDC hdc,
+                                        int partId,
+                                        int stateId,
+                                        LPCRECT rect,
+                                        LPCRECT clipRect) {
+    if (DrawSoftSelection(hdc, partId, stateId, rect, clipRect)) {
+        return S_OK;
+    }
+    return DrawThemeBackground_Original(theme, hdc, partId, stateId, rect,
+                                        clipRect);
+}
+
+using DrawThemeBackgroundEx_t = decltype(&DrawThemeBackgroundEx);
+DrawThemeBackgroundEx_t DrawThemeBackgroundEx_Original;
+
+HRESULT WINAPI DrawThemeBackgroundEx_Hook(HTHEME theme,
+                                          HDC hdc,
+                                          int partId,
+                                          int stateId,
+                                          LPCRECT rect,
+                                          const DTBGOPTS* options) {
+    const RECT* clipRect = nullptr;
+    if (options && (options->dwFlags & DTBG_CLIPRECT)) {
+        clipRect = &options->rcClip;
+    }
+    if (DrawSoftSelection(hdc, partId, stateId, rect, clipRect)) {
+        return S_OK;
+    }
+    return DrawThemeBackgroundEx_Original(theme, hdc, partId, stateId, rect,
+                                          options);
+}
+
+// Bir kanca kurulamazsa özellik o yol için kapalı kalır, mod çalışmaya devam
+// eder.
+void HookSoftSelection() {
+    HMODULE module = GetModuleHandleW(L"uxtheme.dll");
+    if (!module) {
+        module = LoadLibraryExW(L"uxtheme.dll", nullptr,
+                                LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+    auto background = module ? reinterpret_cast<DrawThemeBackground_t>(
+                                   GetProcAddress(module, "DrawThemeBackground"))
+                             : nullptr;
+    auto backgroundEx =
+        module ? reinterpret_cast<DrawThemeBackgroundEx_t>(
+                     GetProcAddress(module, "DrawThemeBackgroundEx"))
+               : nullptr;
+    bool ok = false;
+    if (background &&
+        WindhawkUtils::SetFunctionHook(background, DrawThemeBackground_Hook,
+                                       &DrawThemeBackground_Original)) {
+        ok = true;
+    }
+    if (backgroundEx &&
+        WindhawkUtils::SetFunctionHook(backgroundEx,
+                                       DrawThemeBackgroundEx_Hook,
+                                       &DrawThemeBackgroundEx_Original)) {
+        ok = true;
+    }
+    if (!ok) {
+        Wh_Log(L"soft selection hook unavailable");
+    }
+}
+
 // Bağlı nav ağaçlarını yeniden boyatır (InvalidateRect thread'ler arası
 // güvenlidir); renk ayarı değişince ya da mod kapanınca hemen görünür.
 void InvalidateNavTrees() {
@@ -3742,6 +3956,7 @@ BOOL Wh_ModInit() {
     }
     HookIslandHeight();
     HookDividers();
+    HookSoftSelection();
     return TRUE;
 }
 
@@ -3792,12 +4007,14 @@ void Wh_ModUninit() {
         empty->settings.hideCommandBar = false;
         empty->settings.hidePins = false;
         empty->settings.subtleDividers = false;
+        empty->settings.softSelection = false;
         empty->settings.pinnedPosition = PinnedPosition::Default;
         std::shared_ptr<const Config> old;
         std::lock_guard<std::mutex> lock(g_configMutex);
         old = std::exchange(g_config, std::move(empty));
     }
-    // Kancalar kalktı; ağaçlar Windows'un ayraç rengiyle yeniden boyanır.
+    // Kancalar kalktı; ağaçlar Windows'un ayraç rengi ve vurgusuyla yeniden
+    // boyanır.
     InvalidateNavTrees();
 
     // 1. TAP/watcher: enjeksiyon ve advise thread'lerini bekle, Unadvise.
@@ -3887,7 +4104,8 @@ void Wh_ModSettingsChanged() {
         });
     }
 
-    // Ayraç rengi: tema bilgisi yeniden okunur ve ağaçlar yeniden boyanır.
+    // Ayraç rengi ve seçim vurgusu: tema bilgisi yeniden okunur ve ağaçlar
+    // yeniden boyanır.
     g_lightThemeCheckedAt.store(0);
     InvalidateNavTrees();
 }

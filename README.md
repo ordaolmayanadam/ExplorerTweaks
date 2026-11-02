@@ -13,6 +13,7 @@ Windows 11 File Explorer'ı sadeleştiren, tek başına çalışan bir [Windhawk
   - **Gizleme:** `hidden: true` olan öğeler menüden kaldırılır.
   - **Pinli klasörlerin yeri:** en üstte, en altta ya da Windows varsayılanı.
   - **Ayraçları sadeleştirme:** yatay ayraçlar, sağdaki dikey ayraçla aynı renkte (#F7F7F7) çizilir. Yalnızca açık temada etkilidir; koyu temada Windows'un rengi kalır. Kalınlık ve kenar boşlukları değişmez.
+  - **Seçimi yumuşatma:** açık temada seçili ya da üzerine gelinen öğenin arka planı daha soluk, kenarlıksız, yuvarlak köşeli ve kenarlardan içeride çizilir. Koyu temada Windows'un çizimi kalır.
 
 Her özellik Windhawk ayar ekranından ayrı ayrı açılıp kapatılabilir. Sıra, ad ve pin ikonu değişiklikleri açık pencerelere hemen uygulanır.
 
@@ -46,6 +47,7 @@ Varsayılan ayarlar:
 | `hidePins` | `true` | Quick Access pin ikonlarını kaldır |
 | `pinnedPosition` | `bottom` | Pinli klasörlerin yeri: `default`, `top` ya da `bottom` |
 | `subtleDividers` | `true` | Sol menü ayraçlarını sadeleştir (yalnızca açık temada) |
+| `softSelection` | `true` | Sol menü seçimini yumuşat (yalnızca açık temada) |
 | `navItems` | aşağıya bakın | Sol menü öğeleri |
 
 Varsayılan `navItems` listesi:
