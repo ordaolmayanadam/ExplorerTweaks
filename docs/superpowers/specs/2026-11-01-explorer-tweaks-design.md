@@ -83,7 +83,7 @@ Proje tek bir dosyadan oluşur: `explorer-tweaks.wh.cpp`. Hedef süreç `explore
     2. Pinli öğeler (state image = 1), `pinnedPosition` ayarına göre en başa ya da en sona konur. `default` seçiliyse pinliler yerinde kalır.
     3. Eşit anahtarlarda orijinal sıra korunur (kararlı sıralama). Sıralama öncesi her öğenin indeksi bir haritaya yazılır, eşitlikte bu indeks kullanılır.
   - Kendi sıralamamızın tetiklediği mesajlar yeniden sıralamaya yol açmasın diye yeniden giriş koruması (`g_sorting`) vardır.
-  - Sıralamadan sonra ağacın ilk görünür öğesi (`TVGN_FIRSTVISIBLE`) yeniden ayarlanır. Aksi halde comctl32 eski ilk öğeden çizmeye devam eder ve sol menü boş görünür (2026-11-02 çalışma zamanı bulgusu).
+  - Sıralamadan sonra önce öğe yüksekliği mevcut değerine yeniden ayarlanır (comctl32'yi öğe konumlarını yeniden hesaplamaya zorlar), ardından ağacın ilk görünür öğesi (`TVGN_FIRSTVISIBLE`) yeniden ayarlanır. Aksi halde comctl32 eski ilk öğeden çizmeye devam eder ve sol menü boş görünür (2026-11-02 çalışma zamanı bulgusu).
 - **Bilinen kısıt:** Mod kapatıldığında açık pencerelerin orijinal sırası ancak yenilenince (F5 veya pencereyi yeniden açma) geri gelir.
 
 ### 3.2 CLSID çözümleme

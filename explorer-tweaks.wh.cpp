@@ -1430,6 +1430,15 @@ void ResortTree(HWND tree) {
     sort.lParam = reinterpret_cast<LPARAM>(&target);
     SendMessageW(tree, TVM_SORTCHILDRENCB, 0, reinterpret_cast<LPARAM>(&sort));
 
+    // comctl32, TVM_SORTCHILDRENCB sonrasında öğelerin iç "gösterilen indeks"
+    // değerlerini yeniden hesaplamaz. Geçerli öğe yüksekliğini yeniden
+    // ayarlamak bu hesaplamayı zorlar; aksi halde aşağıdaki ilk görünür öğe
+    // sıfırlaması etkisiz kalır ve sol menü boş çizilir.
+    int height = TreeView_GetItemHeight(tree);
+    if (height > 0) {
+        TreeView_SetItemHeight(tree, height);
+    }
+
     TopItem after = FirstVisibleAfterSort(order, before);
     HTREEITEM newTop = nullptr;
     switch (after.kind) {
