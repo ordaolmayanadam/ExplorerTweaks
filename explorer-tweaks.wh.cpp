@@ -36,6 +36,11 @@ modlara bağlı değildir.
   - Seçili/üzerine gelinen öğenin arka planı açık temada daha soluk,
     kenarlıksız, yuvarlak köşeli ve kenarlardan içeride çizilir
     (`softSelection`; koyu temada Windows'un çizimi kalır).
+- **Sütun başlığının altına çizgi ekler.** Ayrıntılar görünümünde sütun
+  başlıklarının altına, aralarındaki dikey çizgilerle aynı tipte (1 piksel,
+  #E5E5E5) bir çizgi çizilir (`headerUnderline`; yalnızca açık temada). Mod
+  etkinleştirilmeden önce açılmış pencerelerde görünmesi için pencereyi
+  yeniden açmak gerekebilir.
 
 ## Ayarlar
 
@@ -95,6 +100,9 @@ Lisans: GPL-3.0.
 - softSelection: true
   $name: Sol menü seçimini yumuşat
   $description: Açık temada sol menüdeki seçili/üzerine gelinen öğe arka planını daha soluk, kenarlıksız ve kenarlardan içeride çizer.
+- headerUnderline: true
+  $name: Sütun başlığının altına çizgi ekle
+  $description: Açık temada Ayrıntılar görünümündeki sütun başlıklarının altına, aralarındaki dikey çizgilerle aynı tipte ince bir çizgi çizer.
 - navItems:
   - - match: "This PC"
     - newName: ""
@@ -591,6 +599,55 @@ inline RECT SoftSelectionRect(const RECT& rect, int dpi) {
     return result;
 }
 
+// ----- Sütun başlığı alt çizgisi -----
+
+// uxtheme Header parçası (vsstyle.h: HP_HEADERITEM).
+constexpr int kHpHeaderItem = 1;
+
+inline wchar_t AsciiLower(wchar_t c) {
+    return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c - L'A' + L'a') : c;
+}
+
+inline bool EqualsIgnoreCaseAscii(std::wstring_view a, std::wstring_view b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); i++) {
+        if (AsciiLower(a[i]) != AsciiLower(b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// OpenThemeData'ya verilen sınıf listesi (noktalı virgülle ayrılmış, büyük/
+// küçük harf duyarsız) "Header" ya da "...::Header" olan bir öğe içeriyor mu?
+inline bool IsHeaderThemeClass(std::wstring_view classList) {
+    constexpr std::wstring_view kHeader = L"Header";
+    constexpr std::wstring_view kSuffix = L"::Header";
+    while (true) {
+        size_t end = classList.find(L';');
+        std::wstring_view token = classList.substr(0, end);
+        if (EqualsIgnoreCaseAscii(token, kHeader)) {
+            return true;
+        }
+        if (token.size() >= kSuffix.size() &&
+            EqualsIgnoreCaseAscii(
+                token.substr(token.size() - kSuffix.size()), kSuffix)) {
+            return true;
+        }
+        if (end == std::wstring_view::npos) {
+            return false;
+        }
+        classList.remove_prefix(end + 1);
+    }
+}
+
+// Başlık öğesinin alt kenarındaki 1 piksellik çizgi (tüm genişlikte).
+inline RECT HeaderUnderlineRect(const RECT& rect) {
+    return {rect.left, rect.bottom - 1, rect.right, rect.bottom};
+}
+
 // ===== End Logic =====
 
 #ifndef ET_LOGIC_ONLY
@@ -624,6 +681,7 @@ inline RECT SoftSelectionRect(const RECT& rect, int dpi) {
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -664,6 +722,7 @@ struct Settings {
     PinnedPosition pinnedPosition = PinnedPosition::Bottom;
     bool subtleDividers = true;
     bool softSelection = true;
+    bool headerUnderline = true;
     std::vector<NavRule> navItems;
 };
 
@@ -699,6 +758,7 @@ Settings LoadSettings() {
     s.hidePins = Wh_GetIntSetting(L"hidePins") != 0;
     s.subtleDividers = Wh_GetIntSetting(L"subtleDividers") != 0;
     s.softSelection = Wh_GetIntSetting(L"softSelection") != 0;
+    s.headerUnderline = Wh_GetIntSetting(L"headerUnderline") != 0;
 
     PCWSTR pos = Wh_GetStringSetting(L"pinnedPosition");
     if (pos && wcscmp(pos, L"top") == 0) {
@@ -3841,8 +3901,155 @@ bool DrawSoftSelection(HDC hdc,
     return brush && pen;
 }
 
-using DrawThemeBackground_t = decltype(&DrawThemeBackground);
-DrawThemeBackground_t DrawThemeBackground_Original;
+// ----- Sütun başlığı alt çizgisi: kancalar -----
+// Ayrıntılar görünümünün başlığı DirectUI ile çizilir (SysHeader32 yok); başlık
+// öğeleri uxtheme'in "Header" sınıfıyla (HP_HEADERITEM) DrawThemeBackground'a
+// gelir. OpenThemeData* "Header" sınıfı için bir HTHEME döndürünce tutamaç
+// kaydedilir (CloseThemeData'da silinir); mevcut DrawThemeBackground(Ex)
+// kancaları kayıtlı bir tutamaçla gelen HP_HEADERITEM çizimine orijinalden
+// sonra alt kenara 1 piksellik çizgi ekler. Aynı tutamaç birden çok kez
+// döndürülebildiği için kayıt sayaçlıdır. Mod etkinleşmeden önce açılmış
+// tutamaçlar bilinmez; o pencereler yeniden açılınca çizgi görünür.
+
+constexpr COLORREF kHeaderUnderlineColor = RGB(0xE5, 0xE5, 0xE5);
+
+std::shared_mutex g_headerThemesMutex;
+std::unordered_map<HTHEME, int> g_headerThemes;
+
+bool IsHeaderTheme(HTHEME theme) {
+    std::shared_lock<std::shared_mutex> lock(g_headerThemesMutex);
+    return g_headerThemes.count(theme) != 0;
+}
+
+void RecordTheme(HTHEME theme, LPCWSTR classList) {
+    if (!theme) {
+        return;
+    }
+    bool header = classList && IsHeaderThemeClass(classList);
+    std::unique_lock<std::shared_mutex> lock(g_headerThemesMutex);
+    if (header) {
+        g_headerThemes[theme]++;
+    } else {
+        // Tutamaç yeniden kullanıldıysa eski "Header" kaydı geçersizdir.
+        g_headerThemes.erase(theme);
+    }
+}
+
+void ForgetTheme(HTHEME theme) {
+    if (!theme) {
+        return;
+    }
+    std::unique_lock<std::shared_mutex> lock(g_headerThemesMutex);
+    auto it = g_headerThemes.find(theme);
+    if (it != g_headerThemes.end() && --it->second <= 0) {
+        g_headerThemes.erase(it);
+    }
+}
+
+using OpenThemeData_t = HTHEME(WINAPI*)(HWND, LPCWSTR);
+using OpenThemeDataForDpi_t = HTHEME(WINAPI*)(HWND, LPCWSTR, UINT);
+using OpenThemeDataEx_t = HTHEME(WINAPI*)(HWND, LPCWSTR, DWORD);
+using CloseThemeData_t = HRESULT(WINAPI*)(HTHEME);
+OpenThemeData_t OpenThemeData_Original;
+OpenThemeDataForDpi_t OpenThemeDataForDpi_Original;
+OpenThemeDataEx_t OpenThemeDataEx_Original;
+CloseThemeData_t CloseThemeData_Original;
+
+HTHEME WINAPI OpenThemeData_Hook(HWND hwnd, LPCWSTR classList) {
+    HTHEME theme = OpenThemeData_Original(hwnd, classList);
+    RecordTheme(theme, classList);
+    return theme;
+}
+
+HTHEME WINAPI OpenThemeDataForDpi_Hook(HWND hwnd, LPCWSTR classList, UINT dpi) {
+    HTHEME theme = OpenThemeDataForDpi_Original(hwnd, classList, dpi);
+    RecordTheme(theme, classList);
+    return theme;
+}
+
+HTHEME WINAPI OpenThemeDataEx_Hook(HWND hwnd, LPCWSTR classList, DWORD flags) {
+    HTHEME theme = OpenThemeDataEx_Original(hwnd, classList, flags);
+    RecordTheme(theme, classList);
+    return theme;
+}
+
+HRESULT WINAPI CloseThemeData_Hook(HTHEME theme) {
+    // Kapanmadan önce silinir: kapandıktan sonra tutamaç başka bir açılışta
+    // yeniden kullanılabilir.
+    ForgetTheme(theme);
+    return CloseThemeData_Original(theme);
+}
+
+// Başlık öğesinin alt kenarına çizgiyi çizer (orijinal çizimden sonra).
+// clipRect null olabilir.
+void DrawHeaderUnderline(HTHEME theme,
+                         HDC hdc,
+                         int partId,
+                         const RECT* rect,
+                         const RECT* clipRect) {
+    if (partId != kHpHeaderItem || !hdc || !rect || g_unloading.load() ||
+        !IsHeaderTheme(theme) || !GetConfig()->settings.headerUnderline ||
+        !IsLightTheme()) {
+        return;
+    }
+    RECT line = HeaderUnderlineRect(*rect);
+    if (clipRect && !IntersectRect(&line, &line, clipRect)) {
+        return;
+    }
+    if (IsRectEmpty(&line)) {
+        return;
+    }
+    if (HBRUSH brush = CreateSolidBrush(kHeaderUnderlineColor)) {
+        FillRect(hdc, &line, brush);
+        DeleteObject(brush);
+    }
+}
+
+// OpenThemeDataForDpi eski sürümlerde olmayabilir; bulunmayan kanca atlanır.
+void HookHeaderThemes() {
+    {
+        std::unique_lock<std::shared_mutex> lock(g_headerThemesMutex);
+        g_headerThemes.clear();
+    }
+    HMODULE module = GetModuleHandleW(L"uxtheme.dll");
+    if (!module) {
+        module = LoadLibraryExW(L"uxtheme.dll", nullptr,
+                                LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+    if (!module) {
+        Wh_Log(L"header underline hook unavailable");
+        return;
+    }
+    auto open = reinterpret_cast<OpenThemeData_t>(
+        GetProcAddress(module, "OpenThemeData"));
+    auto openForDpi = reinterpret_cast<OpenThemeDataForDpi_t>(
+        GetProcAddress(module, "OpenThemeDataForDpi"));
+    auto openEx = reinterpret_cast<OpenThemeDataEx_t>(
+        GetProcAddress(module, "OpenThemeDataEx"));
+    auto close = reinterpret_cast<CloseThemeData_t>(
+        GetProcAddress(module, "CloseThemeData"));
+    bool ok = false;
+    if (open && WindhawkUtils::SetFunctionHook(open, OpenThemeData_Hook,
+                                               &OpenThemeData_Original)) {
+        ok = true;
+    }
+    if (openForDpi &&
+        WindhawkUtils::SetFunctionHook(openForDpi, OpenThemeDataForDpi_Hook,
+                                       &OpenThemeDataForDpi_Original)) {
+        ok = true;
+    }
+    if (openEx && WindhawkUtils::SetFunctionHook(openEx, OpenThemeDataEx_Hook,
+                                                 &OpenThemeDataEx_Original)) {
+        ok = true;
+    }
+    if (!ok || !close ||
+        !WindhawkUtils::SetFunctionHook(close, CloseThemeData_Hook,
+                                        &CloseThemeData_Original)) {
+        Wh_Log(L"header underline hook unavailable");
+    }
+}
+
+using DrawThemeBackground_t = decltype(&DrawThemeBackground);DrawThemeBackground_t DrawThemeBackground_Original;
 
 HRESULT WINAPI DrawThemeBackground_Hook(HTHEME theme,
                                         HDC hdc,
@@ -3853,8 +4060,12 @@ HRESULT WINAPI DrawThemeBackground_Hook(HTHEME theme,
     if (DrawSoftSelection(hdc, partId, stateId, rect, clipRect)) {
         return S_OK;
     }
-    return DrawThemeBackground_Original(theme, hdc, partId, stateId, rect,
-                                        clipRect);
+    HRESULT hr = DrawThemeBackground_Original(theme, hdc, partId, stateId, rect,
+                                              clipRect);
+    if (SUCCEEDED(hr)) {
+        DrawHeaderUnderline(theme, hdc, partId, rect, clipRect);
+    }
+    return hr;
 }
 
 using DrawThemeBackgroundEx_t = decltype(&DrawThemeBackgroundEx);
@@ -3873,8 +4084,12 @@ HRESULT WINAPI DrawThemeBackgroundEx_Hook(HTHEME theme,
     if (DrawSoftSelection(hdc, partId, stateId, rect, clipRect)) {
         return S_OK;
     }
-    return DrawThemeBackgroundEx_Original(theme, hdc, partId, stateId, rect,
-                                          options);
+    HRESULT hr = DrawThemeBackgroundEx_Original(theme, hdc, partId, stateId,
+                                                rect, options);
+    if (SUCCEEDED(hr)) {
+        DrawHeaderUnderline(theme, hdc, partId, rect, clipRect);
+    }
+    return hr;
 }
 
 // Bir kanca kurulamazsa özellik o yol için kapalı kalır, mod çalışmaya devam
@@ -3924,6 +4139,36 @@ void InvalidateNavTrees() {
     }
 }
 
+// Bu süreçteki Explorer pencerelerinin dosya listelerini (DirectUIHWND)
+// yeniden boyatır (InvalidateRect thread'ler arası güvenlidir); sütun başlığı
+// çizgisi ayarı değişince ya da mod kapanınca hemen görünür.
+void InvalidateFileLists() {
+    EnumWindows(
+        [](HWND window, LPARAM) -> BOOL {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(window, &pid);
+            wchar_t name[64];
+            if (pid != GetCurrentProcessId() ||
+                !GetClassNameW(window, name, ARRAYSIZE(name)) ||
+                wcscmp(name, L"CabinetWClass") != 0) {
+                return TRUE;
+            }
+            EnumChildWindows(
+                window,
+                [](HWND child, LPARAM) -> BOOL {
+                    wchar_t childName[64];
+                    if (GetClassNameW(child, childName, ARRAYSIZE(childName)) &&
+                        wcscmp(childName, L"DirectUIHWND") == 0) {
+                        InvalidateRect(child, nullptr, TRUE);
+                    }
+                    return TRUE;
+                },
+                0);
+            return TRUE;
+        },
+        0);
+}
+
 // ===== Mod lifecycle =====
 
 BOOL Wh_ModInit() {
@@ -3956,6 +4201,7 @@ BOOL Wh_ModInit() {
     }
     HookIslandHeight();
     HookDividers();
+    HookHeaderThemes();
     HookSoftSelection();
     return TRUE;
 }
@@ -4008,6 +4254,7 @@ void Wh_ModUninit() {
         empty->settings.hidePins = false;
         empty->settings.subtleDividers = false;
         empty->settings.softSelection = false;
+        empty->settings.headerUnderline = false;
         empty->settings.pinnedPosition = PinnedPosition::Default;
         std::shared_ptr<const Config> old;
         std::lock_guard<std::mutex> lock(g_configMutex);
@@ -4016,6 +4263,7 @@ void Wh_ModUninit() {
     // Kancalar kalktı; ağaçlar Windows'un ayraç rengi ve vurgusuyla yeniden
     // boyanır.
     InvalidateNavTrees();
+    InvalidateFileLists();
 
     // 1. TAP/watcher: enjeksiyon ve advise thread'lerini bekle, Unadvise.
     StopXaml();
@@ -4108,6 +4356,7 @@ void Wh_ModSettingsChanged() {
     // yeniden boyanır.
     g_lightThemeCheckedAt.store(0);
     InvalidateNavTrees();
+    InvalidateFileLists();
 }
 
 #endif  // ET_LOGIC_ONLY
