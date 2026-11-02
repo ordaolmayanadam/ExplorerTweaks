@@ -144,7 +144,7 @@ static void test_is_clsid() {
 static void test_new_name_for() {
     // Kural 1 (CLSID) "MyPhone" adına çözülmüş ve "Phone" yapıyor; kural 0'ın
     // newName'i boş.
-    CHECK(NewNameFor(SampleRules(), SampleMatch(), L"s25+") == L"Phone");
+    CHECK(NewNameFor(SampleRules(), SampleMatch(), L"myphone") == L"Phone");
     CHECK(NewNameFor(SampleRules(), SampleMatch(), L"This PC").empty());
     CHECK(NewNameFor(SampleRules(), SampleMatch(), L"Nope").empty());
     // Kendi yeni adımız hiçbir kuralla eşleşmez.
