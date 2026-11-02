@@ -796,60 +796,6 @@ inline HeaderGeometry NextHeaderGeometry(const HeaderGeometry& stored,
 #include <unordered_map>
 #include <unordered_set>
 
-// GEÇİCİ TANI (contentBox): 1 iken %TEMP%\et-box.log dosyasına (UTF-8, süreç
-// başına en çok kDiagBoxMaxLines satır) dosya listesi/status bar çizgilerinin
-// ölçümleri yazılır. Kaldırmak için: bu bloğu ve DIAG_BOX çağrılarını silin
-// (ya da 0 yapın; çağrılar boş makroya döner).
-#define ET_DIAG_BOX 1
-
-#if ET_DIAG_BOX
-#include <cstdarg>
-
-constexpr int kDiagBoxMaxLines = 300;
-std::atomic<int> g_diagBoxLines{0};
-
-void DiagBox(const wchar_t* fmt, ...) {
-    if (g_diagBoxLines.fetch_add(1) >= kDiagBoxMaxLines) {
-        return;
-    }
-    wchar_t body[768];
-    va_list args;
-    va_start(args, fmt);
-    StringCchVPrintfW(body, ARRAYSIZE(body), fmt, args);
-    va_end(args);
-    wchar_t line[896];
-    StringCchPrintfW(line, ARRAYSIZE(line), L"[%llu pid=%lu tid=%lu] %s\r\n",
-                     GetTickCount64(), GetCurrentProcessId(),
-                     GetCurrentThreadId(), body);
-
-    char utf8[2048];
-    int bytes = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, sizeof(utf8),
-                                    nullptr, nullptr);
-    if (bytes <= 1) {
-        return;
-    }
-    wchar_t path[MAX_PATH + 16];
-    DWORD len = GetTempPathW(MAX_PATH, path);
-    if (len == 0 || len > MAX_PATH ||
-        FAILED(StringCchCatW(path, ARRAYSIZE(path), L"et-box.log"))) {
-        return;
-    }
-    HANDLE file = CreateFileW(path, FILE_APPEND_DATA,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return;
-    }
-    DWORD written = 0;
-    WriteFile(file, utf8, static_cast<DWORD>(bytes - 1), &written, nullptr);
-    CloseHandle(file);
-}
-
-#define DIAG_BOX(...) DiagBox(__VA_ARGS__)
-#else
-#define DIAG_BOX(...) ((void)0)
-#endif
-
 // Wh_ModBeforeUninit'te true olur. Bundan sonra kancalar hiçbir şey eklemez ve
 // davranışı değiştirmez (doğrudan orijinale geçer), yeni XAML işi başlamaz.
 std::atomic<bool> g_unloading{false};
@@ -4260,21 +4206,6 @@ struct ContentBoxState {
 std::mutex g_contentBoxMutex;
 std::unordered_map<HWND, ContentBoxState> g_contentBoxes;
 
-#if ET_DIAG_BOX
-// "paint begin/end" satırları günlüğü doldurmasın diye ayrı bir sınır;
-// yakalama ve değişen çizim satırları genel sınıra kadar hep yazılır.
-constexpr int kDiagPaintMaxLines = 60;
-std::atomic<int> g_diagPaintLines{0};
-#define DIAG_PAINT(...)                                          \
-    do {                                                         \
-        if (g_diagPaintLines.fetch_add(1) < kDiagPaintMaxLines) { \
-            DiagBox(__VA_ARGS__);                                \
-        }                                                        \
-    } while (0)
-#else
-#define DIAG_PAINT(...) ((void)0)
-#endif
-
 // Bu thread'de süren BeginPaint/EndPaint çiftleri (iç içe boyamalar için
 // yığın). Dosya listesi boyanırken başka bir pencere boyanırsa o pencere için
 // yakalama yapmayan bir çerçeve eklenir; böylece başlık öğeleri yalnızca dosya
@@ -4309,7 +4240,6 @@ void PushPaint(HWND hwnd, bool fileList, const RECT& update) {
     SyncPaintStack();
     if (t_paintDepth >= kMaxPaintDepth) {
         // EndPaint'i gelmeyen çerçeveler birikti; yığın sıfırlanır.
-        DIAG_BOX(L"paint stack overflow; reset");
         t_paintDepth = 0;
     }
     PaintFrame& frame = t_paintStack[t_paintDepth++];
@@ -4355,17 +4285,6 @@ ContentKind ContentKindOf(HWND hwnd) {
         return ContentKind::Outer;
     }
     return ContentKind::None;
-}
-
-const wchar_t* ContentKindName(ContentKind kind) {
-    switch (kind) {
-        case ContentKind::Outer:
-            return L"outer";
-        case ContentKind::FileList:
-            return L"filelist";
-        default:
-            return L"none";
-    }
 }
 
 // g_contentBoxMutex tutulurken çağrılır. Kayıt yoksa (ya da tutamaç başka
@@ -4436,19 +4355,13 @@ void DrawContentBox(HWND hwnd, ContentKind kind, const PaintFrame* frame) {
 
     std::optional<RECT> line;
     std::optional<RECT> stale;
-    bool changed = false;
-    bool headerChanged = false;
     HeaderGeometry header;
     {
         std::lock_guard<std::mutex> lock(g_contentBoxMutex);
         ContentBoxState& state = ContentBoxStateLocked(hwnd, kind);
         if (kind == ContentKind::FileList && frame) {
-            HeaderGeometry next =
+            state.header =
                 NextHeaderGeometry(state.header, frame->drawn, frame->update);
-            headerChanged = next.valid != state.header.valid ||
-                            next.right != state.header.right ||
-                            next.bottom != state.header.bottom;
-            state.header = next;
         }
         header = state.header;
         if (light) {
@@ -4459,8 +4372,6 @@ void DrawContentBox(HWND hwnd, ContentKind kind, const PaintFrame* frame) {
                                        client.right, client.bottom);
             }
         }
-        changed = line ? (!state.hasDrawn || !EqualRect(&state.drawn, &*line))
-                       : state.hasDrawn;
         if (state.hasDrawn && (!line || !EqualRect(&state.drawn, &*line))) {
             stale = state.drawn;
         }
@@ -4468,13 +4379,6 @@ void DrawContentBox(HWND hwnd, ContentKind kind, const PaintFrame* frame) {
         state.drawn = line ? *line : RECT{};
     }
 
-    if (headerChanged) {
-        DIAG_BOX(L"header hwnd=%p: valid=%d right=%d top=%d bottom=%d (drawn "
-                 L"valid=%d right=%d; update %ld,%ld,%ld,%ld)",
-                 hwnd, header.valid, header.right, header.top, header.bottom,
-                 frame->drawn.valid, frame->drawn.right, frame->update.left,
-                 frame->update.top, frame->update.right, frame->update.bottom);
-    }
     if (line) {
         if (HDC dc = GetDCEx(hwnd, nullptr,
                              DCX_CACHE | DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN)) {
@@ -4483,23 +4387,6 @@ void DrawContentBox(HWND hwnd, ContentKind kind, const PaintFrame* frame) {
                 DeleteObject(brush);
             }
             ReleaseDC(hwnd, dc);
-        }
-    }
-    if (changed) {
-        // Tanı günlüğü aynı çizginin tekrarlarıyla dolmasın diye yalnızca
-        // değişiklikler yazılır.
-        if (!line) {
-            DIAG_BOX(L"draw %s hwnd=%p: none (client %ldx%ld)",
-                     ContentKindName(kind), hwnd, client.right, client.bottom);
-        } else if (kind == ContentKind::Outer) {
-            DIAG_BOX(L"draw outer hwnd=%p: y=%ld x=%ld..%ld (client %ldx%ld)",
-                     hwnd, line->top, line->left, line->right, client.right,
-                     client.bottom);
-        } else {
-            DIAG_BOX(L"draw filelist hwnd=%p: x=%ld y=%ld..%ld (client "
-                     L"%ldx%ld)",
-                     hwnd, line->left, line->top, line->bottom, client.right,
-                     client.bottom);
         }
     }
     if (stale) {
@@ -4526,31 +4413,21 @@ void CaptureHeaderItem(HTHEME theme, HDC hdc, int partId, const RECT* rect) {
     if (!LPtoDP(hdc, pts, 2)) {
         return;
     }
-    POINT device[2] = {pts[0], pts[1]};
     POINT origin{paint->update.left, paint->update.top};
     HWND dcWindow = WindowFromDC(hdc);
-    const wchar_t* mode;
     if (dcWindow == paint->hwnd) {
-        mode = L"window";
+        // İstemci koordinatları zaten.
     } else if (dcWindow) {
         MapWindowPoints(dcWindow, paint->hwnd, pts, 2);
-        mode = L"other-window";
     } else {
         for (POINT& pt : pts) {
             pt.x += origin.x;
             pt.y += origin.y;
         }
-        mode = L"memory";
     }
     RECT client{std::min(pts[0].x, pts[1].x), std::min(pts[0].y, pts[1].y),
                 std::max(pts[0].x, pts[1].x), std::max(pts[0].y, pts[1].y)};
     AccumulateHeaderItem(paint->drawn, client);
-    DIAG_BOX(L"capture hwnd=%p dcWnd=%p mode=%s rect=%ld,%ld,%ld,%ld "
-             L"dev=%ld,%ld,%ld,%ld origin=%ld,%ld client=%ld,%ld,%ld,%ld",
-             paint->hwnd, dcWindow, mode, rect->left, rect->top, rect->right,
-             rect->bottom, device[0].x, device[0].y, device[1].x, device[1].y,
-             origin.x, origin.y, client.left, client.top, client.right,
-             client.bottom);
 }
 
 using BeginPaint_t = decltype(&BeginPaint);
@@ -4565,15 +4442,8 @@ HDC WINAPI BeginPaint_Hook(HWND hwnd, LPPAINTSTRUCT ps) {
     if (kind == ContentKind::FileList) {
         if (GetConfig()->settings.contentBox) {
             PushPaint(hwnd, true, ps->rcPaint);
-            DIAG_PAINT(L"paint begin kind=filelist hwnd=%p rcPaint=%ld,%ld,%ld,"
-                       L"%ld",
-                       hwnd, ps->rcPaint.left, ps->rcPaint.top,
-                       ps->rcPaint.right, ps->rcPaint.bottom);
         }
         return hdc;
-    }
-    if (kind == ContentKind::Outer) {
-        DIAG_PAINT(L"paint begin kind=outer hwnd=%p", hwnd);
     }
     // Bir boyamanın içinde başka bir pencere boyanıyor: yakalama yapmayan bir
     // çerçeve eklenir (EndPaint'te çıkarılır).
@@ -4599,8 +4469,6 @@ BOOL WINAPI EndPaint_Hook(HWND hwnd, const PAINTSTRUCT* ps) {
     if (kind == ContentKind::None) {
         return result;
     }
-    DIAG_PAINT(L"paint end kind=%s hwnd=%p frame=%d", ContentKindName(kind),
-               hwnd, hasFrame && frame.fileList);
     if (!GetConfig()->settings.contentBox) {
         return result;
     }
