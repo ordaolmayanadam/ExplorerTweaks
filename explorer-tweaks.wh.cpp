@@ -717,9 +717,51 @@ constexpr wchar_t kBackupListName[] = L"backupList";
 constexpr size_t kBackupListChars = 8192;
 constexpr size_t kBackupValueChars = 64;
 
-// Ayarlar ve Uninit farklı thread'lerden gizleme yapabilir; durum (storage +
-// registry) tek seferde bir thread'de değişir.
-std::mutex g_hiddenMutex;
+// Durum (storage + registry) aynı anda yalnızca bir yerde değişir. Windhawk
+// storage'ı ve HKCU, modun yüklü olduğu tüm explorer.exe süreçlerince
+// paylaşılır ve Wh_ModSettingsChanged hepsinde çalışır; bu yüzden plan +
+// uygulama + geri yükleme oturum genelinde adlı bir mutex altında yapılır.
+// Mutex oluşturulamazsa süreç içi kilide düşülür.
+constexpr wchar_t kHiddenMutexName[] = L"Local\\ExplorerTweaks_Hidden";
+constexpr DWORD kHiddenLockTimeoutMs = 10000;
+HANDLE g_hiddenMutex = nullptr;
+std::mutex g_hiddenLocalMutex;
+
+class HiddenLock {
+   public:
+    HiddenLock() {
+        if (!g_hiddenMutex) {
+            m_local = std::unique_lock<std::mutex>(g_hiddenLocalMutex);
+            m_acquired = true;
+            return;
+        }
+        DWORD wait = WaitForSingleObject(g_hiddenMutex, kHiddenLockTimeoutMs);
+        // Sahibi kilidi bırakmadan çıktıysa (WAIT_ABANDONED) kilit yine bize
+        // geçer; yarım kalan işlem idempotent adımlarla yeniden yapılır.
+        m_owned = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+        m_acquired = m_owned;
+        if (wait == WAIT_ABANDONED) {
+            Wh_Log(L"HiddenLock: previous owner exited while holding the lock");
+        } else if (!m_owned) {
+            Wh_Log(L"HiddenLock: wait failed (%lu, %u); skipping",
+                   static_cast<unsigned long>(wait), GetLastError());
+        }
+    }
+    ~HiddenLock() {
+        if (m_owned) {
+            ReleaseMutex(g_hiddenMutex);
+        }
+    }
+    HiddenLock(const HiddenLock&) = delete;
+    HiddenLock& operator=(const HiddenLock&) = delete;
+
+    bool Acquired() const { return m_acquired; }
+
+   private:
+    std::unique_lock<std::mutex> m_local;
+    bool m_owned = false;
+    bool m_acquired = false;
+};
 
 std::wstring ClsidKeyPath(std::wstring_view clsid) {
     std::wstring path = L"Software\\Classes\\CLSID\\";
@@ -890,11 +932,35 @@ std::wstring FindClsidByName(std::wstring_view name) {
     return L"";
 }
 
+bool EnsureHidden(const std::wstring& clsid);
+
+// Storage'daki yedek değeri; yoksa ya da çözümlenemiyorsa false.
+bool ReadBackupValue(std::wstring_view clsid, BackupValue& out) {
+    std::wstring name = BackupValueName(clsid);
+    wchar_t buf[kBackupValueChars];
+    size_t n = Wh_GetStringValue(name.c_str(), buf, ARRAYSIZE(buf));
+    return n != 0 && ParseBackupValue(std::wstring_view(buf, n), out);
+}
+
 // clsid'i yedekleyip gizler. Sıra: (1) mevcut değeri oku, (2) yedek değerini
 // yaz, (3) yedek listesine ekle, (4) registry'ye 0 yaz. Registry yazımı
 // başarısız olursa 2-3 geri alınır; böylece yedeği olmayan bir CLSID'in
 // "gizlenmiş" sayılması ya da başarısız yazım için yedek kalması olmaz.
+// Geçerli bir yedek zaten varsa (başka bir süreç ya da yarım kalmış bir tur
+// yazmış) asla üzerine yazılmaz: o anki registry değeri zaten bizim 0'ımız
+// olabilir. Yalnızca listede olduğu ve gizli olduğu sağlanır.
 bool HideOne(const std::wstring& clsid) {
+    BackupValue existing;
+    if (ReadBackupValue(clsid, existing)) {
+        Wh_Log(L"HideOne: %s already has a backup (%s); keeping it",
+               clsid.c_str(), SerializeBackupValue(existing).c_str());
+        std::vector<std::wstring> list = LoadBackupList();
+        if (AddToBackupList(list, clsid) && !SaveBackupList(list)) {
+            return false;
+        }
+        return EnsureHidden(clsid);
+    }
+
     BackupValue original;
     if (!ReadPinnedValue(clsid, original)) {
         return false;
@@ -943,29 +1009,28 @@ bool EnsureHidden(const std::wstring& clsid) {
 
 // Yedeği geri yazar ve yedek kaydını siler. Sıra: (1) registry'yi geri yaz,
 // (2) listeden çıkar, (3) yedek değerini sil; her adım arasında çökme sonraki
-// çalıştırmada aynı işlemi güvenle tekrarlatır. Geri yazım başarısızsa yedek
-// korunur (false). Registry değiştiyse changed true olur.
+// çalıştırmada aynı işlemi güvenle tekrarlatır. Geri yazım başarısızsa ya da
+// yedek okunamıyorsa liste kaydı korunur ve sonraki turda yeniden denenir
+// (false); kaydı düşürmek öğeyi orijinal değeri bilinmeden gizli bırakırdı.
+// Registry değiştiyse changed true olur.
 bool RestoreOne(const std::wstring& clsid, bool& changed) {
     std::wstring name = BackupValueName(clsid);
-    wchar_t buf[kBackupValueChars];
-    size_t n = Wh_GetStringValue(name.c_str(), buf, ARRAYSIZE(buf));
     BackupValue backup;
-    bool valid = n != 0 && ParseBackupValue(std::wstring_view(buf, n), backup);
-
-    if (valid) {
-        bool ok = backup.absent ? DeletePinnedValue(clsid)
-                                : WritePinnedValue(clsid, backup.value);
-        if (!ok) {
-            return false;
-        }
-        changed = true;
-        Wh_Log(L"RestoreOne: restored %s (%s)", clsid.c_str(),
-               SerializeBackupValue(backup).c_str());
-    } else {
-        // Geri yüklenecek bir şey yok; kayıt takılı kalmasın diye düşülür.
-        Wh_Log(L"RestoreOne: no valid backup for %s; dropping entry",
+    if (!ReadBackupValue(clsid, backup)) {
+        Wh_Log(L"RestoreOne: backup for %s could not be read; keeping the "
+               L"entry and retrying later",
                clsid.c_str());
+        return false;
     }
+
+    bool ok = backup.absent ? DeletePinnedValue(clsid)
+                            : WritePinnedValue(clsid, backup.value);
+    if (!ok) {
+        return false;
+    }
+    changed = true;
+    Wh_Log(L"RestoreOne: restored %s (%s)", clsid.c_str(),
+           SerializeBackupValue(backup).c_str());
 
     std::vector<std::wstring> list = LoadBackupList();
     RemoveFromBackupList(list, clsid);
@@ -988,8 +1053,18 @@ std::atomic<bool> g_hiddenUnresolved{false};
 // geri yükler. Tekrar çağrılması zararsızdır (idempotent). Çözülemeyen bir
 // gizli isim kuralı varsa o turda geri yükleme yapılmaz (kuralın yedeği geri
 // yüklenip öğe görünür kalmasın) ve yeniden deneme istenir.
+// Mod kaldırılırken (g_unloading) hiçbir şey yapmaz: Wh_ModUninit
+// RestoreAllHidden ile yedekleri geri yükler ve sonradan gelen bir tur onları
+// yeniden gizlememelidir.
 void ApplyHidden() {
-    std::lock_guard<std::mutex> lock(g_hiddenMutex);
+    if (g_unloading.load()) {
+        return;
+    }
+    HiddenLock lock;
+    // Kilit beklenirken Uninit geri yüklemiş olabilir.
+    if (!lock.Acquired() || g_unloading.load()) {
+        return;
+    }
     ComScope com;  // isim kuralları için kabuk çağrıları
     auto config = GetConfig();
 
@@ -1022,7 +1097,12 @@ void ApplyHidden() {
 
 // Bütün yedekleri geri yükler (mod kaldırılırken).
 void RestoreAllHidden() {
-    std::lock_guard<std::mutex> lock(g_hiddenMutex);
+    HiddenLock lock;
+    if (!lock.Acquired()) {
+        // Kilidi tutan diğer süreç kendi kapanışında geri yükler; yedekler
+        // storage'da durur ve sonraki Wh_ModInit de geri yükler.
+        return;
+    }
     bool changed = false;
     for (const std::wstring& clsid : LoadBackupList()) {
         RestoreOne(clsid, changed);
@@ -1589,8 +1669,13 @@ void PostReapplyToAllTrees() {
 // Süreç genelinde en fazla kResolveRetryMs'de bir dener; süre dolmamışsa kalan
 // süre için bu ağaçta bir zamanlayıcı kurar. Ağacın (STA) UI thread'inde
 // çağrılır. Kabuk çağrıları hiçbir kilit tutulmadan yapılır (ApplyHidden yalnızca
-// kendi kısa süreli g_hiddenMutex'ini alır ve hiçbir pencere işlemi yapmaz).
+// adlı gizleme kilidini alır ve hiçbir pencere işlemi yapmaz; kilit başka bir
+// Explorer sürecinde tutuluyorsa en fazla kHiddenLockTimeoutMs bekler, bu da
+// yalnızca çözülemeyen gizli isim kuralı varken olur).
 void RetryClsidResolution(HWND tree) {
+    if (g_unloading.load()) {
+        return;
+    }
     auto base = GetConfig();
     bool hiddenPending = g_hiddenUnresolved.load();
     if (!hiddenPending &&
@@ -3361,6 +3446,12 @@ BOOL Wh_ModInit() {
     g_runMsg = RegisterWindowMessageW(L"ExplorerTweaks_Run");
     g_reapplyMsg = RegisterWindowMessageW(L"ExplorerTweaks_Reapply");
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_hiddenMutex = CreateMutexW(nullptr, FALSE, kHiddenMutexName);
+    if (!g_hiddenMutex) {
+        Wh_Log(L"CreateMutexW(%s) failed (%u); hiding is not synchronized "
+               L"with other Explorer processes",
+               kHiddenMutexName, GetLastError());
+    }
     ReloadConfig();
     ApplyHidden();
     if (!WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook,
@@ -3410,20 +3501,9 @@ void Wh_ModUninit() {
     bool hadCommandBarHidden = g_commandBarCollapsed.load() ||
                                GetConfig()->settings.hideCommandBar;
 
-    // 1. TAP/watcher: enjeksiyon ve advise thread'lerini bekle, Unadvise.
-    StopXaml();
-    // 2. XAML değişikliklerini sahibi olan UI thread'lerinde geri al.
-    RestoreXaml();
-    if (hadCommandBarHidden) {
-        // Island yükseklik kancası kalktı; Explorer yeniden ölçsün.
-        NudgeExplorerLayouts();
-    }
-    // 3. Registry ile gizleme.
-    RestoreAllHidden();
-
-    // 4. Ağaçlar: adlar kuralsız bir Config ile orijinallerine döner, sonra
-    // subclass'lar kaldırılır, zamanlayıcılar öldürülür ve state image list
-    // geri konur. Her ağacın kendi thread'inde.
+    // 0. Kuralsız, her şeyi kapalı bir Config yayınlanır. Bundan sonra hiçbir
+    // yol (ayar değişikliği, CLSID yeniden denemesi, XAML) gizleme ya da
+    // yeniden adlandırma uygulamaz; ağaçlar adlarını bununla geri alır.
     {
         auto empty = std::make_shared<Config>();
         empty->settings.hideTabs = false;
@@ -3434,6 +3514,22 @@ void Wh_ModUninit() {
         std::lock_guard<std::mutex> lock(g_configMutex);
         old = std::exchange(g_config, std::move(empty));
     }
+
+    // 1. TAP/watcher: enjeksiyon ve advise thread'lerini bekle, Unadvise.
+    StopXaml();
+    // 2. XAML değişikliklerini sahibi olan UI thread'lerinde geri al.
+    RestoreXaml();
+    if (hadCommandBarHidden) {
+        // Island yükseklik kancası kalktı; Explorer yeniden ölçsün.
+        NudgeExplorerLayouts();
+    }
+    // 3. Registry ile gizleme (ApplyHidden artık g_unloading yüzünden
+    // yeniden gizlemez).
+    RestoreAllHidden();
+
+    // 4. Ağaçlar: adlar boş Config ile orijinallerine döner, sonra
+    // subclass'lar kaldırılır, zamanlayıcılar öldürülür ve state image list
+    // geri konur. Her ağacın kendi thread'inde.
     std::vector<HWND> trees;
     {
         std::lock_guard<std::mutex> lock(g_treesMutex);
@@ -3458,9 +3554,17 @@ void Wh_ModUninit() {
         }
     }
 
-    if (g_stopEvent) {
-        CloseHandle(g_stopEvent);
-        g_stopEvent = nullptr;
+    // Sabitlendiyse geride kalan kod bu tutamaçları hâlâ kullanabilir;
+    // kapatılmaz (süreç ömrü boyunca küçük bir sızıntı).
+    if (!g_modulePinned.load()) {
+        if (g_stopEvent) {
+            CloseHandle(g_stopEvent);
+            g_stopEvent = nullptr;
+        }
+        if (g_hiddenMutex) {
+            CloseHandle(g_hiddenMutex);
+            g_hiddenMutex = nullptr;
+        }
     }
 }
 
