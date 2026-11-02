@@ -415,8 +415,52 @@ static void test_divider_color_override() {
     CHECK(!DividerColorOverride(false, false).has_value());
 }
 
+static void test_soft_selection_color() {
+    // TVP_TREEITEM = 1; TREIS_HOT = 2, SELECTED = 3, SELECTEDNOTFOCUS = 5,
+    // HOTSELECTED = 6.
+    CHECK(SoftSelectionColor(true, true, 1, 2).value_or(0) ==
+          RGB(0xEE, 0xF5, 0xFC));
+    CHECK(SoftSelectionColor(true, true, 1, 3).value_or(0) ==
+          RGB(0xE1, 0xEE, 0xFB));
+    CHECK(SoftSelectionColor(true, true, 1, 5).value_or(0) ==
+          RGB(0xED, 0xED, 0xED));
+    CHECK(SoftSelectionColor(true, true, 1, 6).value_or(0) ==
+          RGB(0xD9, 0xE8, 0xF8));
+    // Diğer durumlar (NORMAL=1, DISABLED=4, 7) ve diğer parçalar dokunulmaz.
+    CHECK(!SoftSelectionColor(true, true, 1, 1).has_value());
+    CHECK(!SoftSelectionColor(true, true, 1, 4).has_value());
+    CHECK(!SoftSelectionColor(true, true, 1, 7).has_value());
+    CHECK(!SoftSelectionColor(true, true, 2, 2).has_value());
+    CHECK(!SoftSelectionColor(true, true, 0, 0).has_value());
+    // Ayar kapalı ya da koyu tema.
+    CHECK(!SoftSelectionColor(false, true, 1, 2).has_value());
+    CHECK(!SoftSelectionColor(true, false, 1, 2).has_value());
+    CHECK(!SoftSelectionColor(false, false, 1, 6).has_value());
+}
+
+static void test_soft_selection_metrics() {
+    CHECK(SoftSelectionInset(96) == 6);
+    CHECK(SoftSelectionInset(144) == 9);
+    CHECK(SoftSelectionInset(192) == 12);
+    CHECK(SoftSelectionRadius(96) == 4);
+    CHECK(SoftSelectionRadius(144) == 6);
+    CHECK(SoftSelectionRadius(192) == 8);
+}
+
+static void test_soft_selection_rect() {
+    RECT r = SoftSelectionRect({10, 20, 210, 44}, 96);
+    CHECK(r.left == 16 && r.right == 204 && r.top == 20 && r.bottom == 44);
+    // Çok dar dikdörtgen ters dönmez.
+    RECT narrow = SoftSelectionRect({0, 0, 8, 10}, 96);
+    CHECK(narrow.left <= narrow.right);
+    CHECK(narrow.top == 0 && narrow.bottom == 10);
+}
+
 int main() {
     test_divider_color_override();
+    test_soft_selection_color();
+    test_soft_selection_metrics();
+    test_soft_selection_rect();
     test_thread_record_stale();
     test_sort_unique();
     test_backup_list();
