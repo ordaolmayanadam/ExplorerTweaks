@@ -7,7 +7,7 @@
 // @license         GPL-3.0
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -lcomctl32 -lole32 -loleaut32 -lshlwapi -lruntimeobject
+// @compilerOptions -lcomctl32 -lgdi32 -lole32 -loleaut32 -lshlwapi -lruntimeobject
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -30,6 +30,9 @@ modlara bağlı değildir.
   - Yeniden adlandırma: `newName` boş değilse öğe bu adla gösterilir.
   - Gizleme: `hidden: true` olan öğeler menüden kaldırılır.
   - Pinli klasörler en üste, en alta ya da Windows'un yerine konur.
+  - Yatay ayraçlar sağdaki dikey ayraçla aynı renkte (#F7F7F7) çizilir
+    (`subtleDividers`; yalnızca açık temada, koyu temada Windows'un rengi
+    kalır).
 
 ## Ayarlar
 
@@ -83,6 +86,9 @@ Lisans: GPL-3.0.
   - default: Windows varsayılanı
   - top: En üstte
   - bottom: En altta
+- subtleDividers: true
+  $name: Sol menü ayraçlarını sadeleştir
+  $description: Yatay ayraçları sağdaki dikey ayraçla aynı renkte (açık temada) çizer.
 - navItems:
   - - match: "This PC"
     - newName: ""
@@ -106,6 +112,7 @@ Lisans: GPL-3.0.
 #include <algorithm>
 #include <climits>
 #include <cwchar>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -504,6 +511,18 @@ void SortUnique(std::vector<T>& values) {
     values.erase(std::unique(values.begin(), values.end()), values.end());
 }
 
+// ----- Sol menü ayraçları -----
+
+// Yatay ayraçların rengi: ayar açık ve tema açıksa sağdaki dikey ayraçla aynı
+// renk (#F7F7F7), aksi halde Windows'un rengi kalır (nullopt).
+inline std::optional<COLORREF> DividerColorOverride(bool enabled,
+                                                    bool lightTheme) {
+    if (!enabled || !lightTheme) {
+        return std::nullopt;
+    }
+    return RGB(0xF7, 0xF7, 0xF7);
+}
+
 // ===== End Logic =====
 
 #ifndef ET_LOGIC_ONLY
@@ -574,6 +593,7 @@ struct Settings {
     bool hideCommandBar = true;
     bool hidePins = true;
     PinnedPosition pinnedPosition = PinnedPosition::Bottom;
+    bool subtleDividers = true;
     std::vector<NavRule> navItems;
 };
 
@@ -607,6 +627,7 @@ Settings LoadSettings() {
     s.hideTabs = Wh_GetIntSetting(L"hideTabs") != 0;
     s.hideCommandBar = Wh_GetIntSetting(L"hideCommandBar") != 0;
     s.hidePins = Wh_GetIntSetting(L"hidePins") != 0;
+    s.subtleDividers = Wh_GetIntSetting(L"subtleDividers") != 0;
 
     PCWSTR pos = Wh_GetStringSetting(L"pinnedPosition");
     if (pos && wcscmp(pos, L"top") == 0) {
@@ -3578,6 +3599,117 @@ void HookIslandHeight() {
     }
 }
 
+// ----- Sol menü ayraçları -----
+// CNscTree::DrawDivider (ExplorerFrame.dll) yatay ayraçları kendi kalemiyle
+// (CreatePen + Polyline) çizer. DrawDivider kancası yalnızca "şu an ayraç
+// çiziyoruz" bayrağını kurar; CreatePen kancası bu bayrak varken kalemin
+// rengini değiştirir. Kalınlık ve kenar boşlukları değişmez.
+
+// DrawDivider çağrısı sürerken (o thread'de) true.
+thread_local bool t_inDrawDivider = false;
+
+struct DividerScope {
+    bool previous;
+    DividerScope() : previous(t_inDrawDivider) { t_inDrawDivider = true; }
+    ~DividerScope() { t_inDrawDivider = previous; }
+    DividerScope(const DividerScope&) = delete;
+    DividerScope& operator=(const DividerScope&) = delete;
+};
+
+// Açık/koyu tema bilgisi kayıt defterinden okunur; boyama yolunda her
+// CreatePen'de kayıt defterine gidilmesin diye en çok 2 sn'de bir yenilenir.
+// Değer 0 ise henüz okunmadı (Wh_ModInit ve ayar değişikliği sıfırlar).
+constexpr unsigned long long kThemeRefreshMs = 2000;
+std::atomic<bool> g_lightTheme{true};
+std::atomic<unsigned long long> g_lightThemeCheckedAt{0};
+
+bool ReadLightThemeFromRegistry() {
+    DWORD value = 1;
+    DWORD size = sizeof(value);
+    LSTATUS status = RegGetValueW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size);
+    // Değer yoksa (ya da okunamazsa) açık tema sayılır.
+    return status != ERROR_SUCCESS || value != 0;
+}
+
+bool IsLightTheme() {
+    unsigned long long now = GetTickCount64();
+    unsigned long long last = g_lightThemeCheckedAt.load();
+    if (last == 0 || RetryDelay(now, last, kThemeRefreshMs) == 0) {
+        g_lightTheme.store(ReadLightThemeFromRegistry());
+        g_lightThemeCheckedAt.store(now ? now : 1);
+    }
+    return g_lightTheme.load();
+}
+
+using CreatePen_t = decltype(&CreatePen);
+CreatePen_t CreatePen_Original;
+
+HPEN WINAPI CreatePen_Hook(int iStyle, int cWidth, COLORREF color) {
+    if (t_inDrawDivider && !g_unloading.load() &&
+        GetConfig()->settings.subtleDividers) {
+        if (auto override = DividerColorOverride(true, IsLightTheme())) {
+            color = *override;
+        }
+    }
+    return CreatePen_Original(iStyle, cWidth, color);
+}
+
+using CNscTree_DrawDivider_t = void (*)(void*, HDC, HTREEITEM);
+CNscTree_DrawDivider_t CNscTree_DrawDivider_Original;
+
+void CNscTree_DrawDivider_Hook(void* pThis, HDC hdc, HTREEITEM item) {
+    DividerScope scope;
+    CNscTree_DrawDivider_Original(pThis, hdc, item);
+}
+
+// Sembol bulunamazsa özellik kapalı kalır (CreatePen kancası da kurulmaz).
+void HookDividers() {
+    HMODULE module = GetModuleHandleW(L"ExplorerFrame.dll");
+    if (!module) {
+        module = LoadLibraryExW(L"ExplorerFrame.dll", nullptr,
+                                LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+    if (!module) {
+        Wh_Log(L"divider hook unavailable");
+        return;
+    }
+    WindhawkUtils::SYMBOL_HOOK hooks[] = {
+        {
+            {L"private: void __cdecl CNscTree::DrawDivider(struct HDC__ *,"
+             L"struct _TREEITEM *)"},
+            &CNscTree_DrawDivider_Original,
+            CNscTree_DrawDivider_Hook,
+            false,
+        },
+    };
+    if (!WindhawkUtils::HookSymbols(module, hooks, ARRAYSIZE(hooks))) {
+        Wh_Log(L"divider hook unavailable");
+        return;
+    }
+    if (!WindhawkUtils::SetFunctionHook(CreatePen, CreatePen_Hook,
+                                        &CreatePen_Original)) {
+        Wh_Log(L"divider hook unavailable (CreatePen)");
+    }
+}
+
+// Bağlı nav ağaçlarını yeniden boyatır (InvalidateRect thread'ler arası
+// güvenlidir); renk ayarı değişince ya da mod kapanınca hemen görünür.
+void InvalidateNavTrees() {
+    std::vector<HWND> trees;
+    {
+        std::lock_guard<std::mutex> lock(g_treesMutex);
+        trees.assign(g_trees.begin(), g_trees.end());
+    }
+    for (HWND tree : trees) {
+        if (IsWindow(tree)) {
+            InvalidateRect(tree, nullptr, TRUE);
+        }
+    }
+}
+
 // ===== Mod lifecycle =====
 
 BOOL Wh_ModInit() {
@@ -3591,6 +3723,7 @@ BOOL Wh_ModInit() {
     g_commandBarCollapsed.store(false);
     g_hiddenUnresolved.store(false);
     g_lastResolveAttempt.store(0);
+    g_lightThemeCheckedAt.store(0);
 
     g_runMsg = RegisterWindowMessageW(L"ExplorerTweaks_Run");
     g_reapplyMsg = RegisterWindowMessageW(L"ExplorerTweaks_Reapply");
@@ -3608,6 +3741,7 @@ BOOL Wh_ModInit() {
         Wh_Log(L"CreateWindowExW hook failed; only existing windows sorted");
     }
     HookIslandHeight();
+    HookDividers();
     return TRUE;
 }
 
@@ -3657,11 +3791,14 @@ void Wh_ModUninit() {
         empty->settings.hideTabs = false;
         empty->settings.hideCommandBar = false;
         empty->settings.hidePins = false;
+        empty->settings.subtleDividers = false;
         empty->settings.pinnedPosition = PinnedPosition::Default;
         std::shared_ptr<const Config> old;
         std::lock_guard<std::mutex> lock(g_configMutex);
         old = std::exchange(g_config, std::move(empty));
     }
+    // Kancalar kalktı; ağaçlar Windows'un ayraç rengiyle yeniden boyanır.
+    InvalidateNavTrees();
 
     // 1. TAP/watcher: enjeksiyon ve advise thread'lerini bekle, Unadvise.
     StopXaml();
@@ -3749,6 +3886,10 @@ void Wh_ModSettingsChanged() {
             ResortTree(tree);
         });
     }
+
+    // Ayraç rengi: tema bilgisi yeniden okunur ve ağaçlar yeniden boyanır.
+    g_lightThemeCheckedAt.store(0);
+    InvalidateNavTrees();
 }
 
 #endif  // ET_LOGIC_ONLY

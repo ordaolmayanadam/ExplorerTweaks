@@ -64,6 +64,7 @@ Proje tek bir dosyadan oluşur: `explorer-tweaks.wh.cpp`. Hedef süreç `explore
 | Toolbar'ı gizle | Aynı XAML altyapısı: `FileExplorerExtensions.CommandBarControl` → `Collapsed` | Yeni pencerelerde |
 | Pin ikonlarını kaldır | Ağaç subclass'ı `TVM_SETIMAGELIST(TVSIL_STATE)` mesajını yakalar: ayar açıkken gelen liste saklanır, ağaca kurulmaz; kapanınca saklanan liste geri konur (2026-11-02 değişikliği; ilk tasarımdaki `CNscTree::SetStateImageList` sembol hook'u kaldırıldı) | Anında |
 | Sol menü: sıra, ad, pinlilerin yeri | Nav pane ağacının subclass'ı | Anında |
+| Sol menü: ayraç rengi (yalnızca açık tema) | `CNscTree::DrawDivider` (ExplorerFrame.dll) sembol hook'u thread-local bayrak kurar; `CreatePen` hook'u bayrak varken kalem rengini #F7F7F7 (dikey ayraçla aynı) yapar. Koyu temada Windows rengi kalır; tema `AppsUseLightTheme` değerinden okunur (2 sn önbellek) | Anında |
 | Sol menü: gizleme | `HKCU\Software\Classes\CLSID\{…}\System.IsPinnedToNameSpaceTree = 0`, yedekle ve geri yükle | Explorer yeniden açılınca |
 
 ### 3.1 Nav pane subclass
@@ -128,6 +129,9 @@ Proje tek bir dosyadan oluşur: `explorer-tweaks.wh.cpp`. Hedef süreç `explore
   - default: Windows varsayılanı
   - top: En üstte
   - bottom: En altta
+- subtleDividers: true
+  $name: Sol menü ayraçlarını sadeleştir
+  $description: Yatay ayraçları sağdaki dikey ayraçla aynı renkte (açık temada) çizer.
 - navItems:
   - - match: "This PC"
     - newName: ""
