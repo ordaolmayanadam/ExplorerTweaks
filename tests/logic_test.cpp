@@ -21,7 +21,7 @@ static const wchar_t* kPhoneClsid = L"{3611C374-393E-41F8-98EB-1AD7BF051346}";
 static std::vector<NavEntry> SampleEntries() {
     return {{L"Downloads", true},
             {L"Documents", true},
-            {L"S25+", false},
+            {L"MyPhone", false},
             {L"This PC", false},
             {L"Linux", false}};
 }
@@ -33,7 +33,7 @@ static std::vector<NavRule> SampleRules() {
 }
 
 static std::vector<std::wstring> SampleMatch() {
-    return {L"This PC", L"S25+", L"Linux"};
+    return {L"This PC", L"MyPhone", L"Linux"};
 }
 
 using Order = std::vector<int>;
@@ -142,22 +142,22 @@ static void test_is_clsid() {
 }
 
 static void test_new_name_for() {
-    // Kural 1 (CLSID) "S25+" adına çözülmüş ve "Phone" yapıyor; kural 0'ın
+    // Kural 1 (CLSID) "MyPhone" adına çözülmüş ve "Phone" yapıyor; kural 0'ın
     // newName'i boş.
     CHECK(NewNameFor(SampleRules(), SampleMatch(), L"s25+") == L"Phone");
     CHECK(NewNameFor(SampleRules(), SampleMatch(), L"This PC").empty());
     CHECK(NewNameFor(SampleRules(), SampleMatch(), L"Nope").empty());
     // Kendi yeni adımız hiçbir kuralla eşleşmez.
     CHECK(NewNameFor(SampleRules(), SampleMatch(), L"Phone").empty());
-    CHECK(DisplayNameFor(SampleRules(), SampleMatch(), L"S25+") == L"Phone");
+    CHECK(DisplayNameFor(SampleRules(), SampleMatch(), L"MyPhone") == L"Phone");
     CHECK(DisplayNameFor(SampleRules(), SampleMatch(), L"Linux") == L"Linux");
 }
 
 static void test_incoming_text_new_item() {
     // Kayıt yok: gelen metin orijinaldir, kurala göre yeni ad gösterilir.
     NameUpdate u = ResolveIncomingText(SampleRules(), SampleMatch(), nullptr,
-                                       L"S25+");
-    CHECK(u.original == L"S25+");
+                                       L"MyPhone");
+    CHECK(u.original == L"MyPhone");
     CHECK(u.display == L"Phone");
 
     u = ResolveIncomingText(SampleRules(), SampleMatch(), nullptr, L"Linux");
@@ -168,22 +168,22 @@ static void test_incoming_text_new_item() {
 static void test_incoming_text_already_renamed() {
     // Explorer bizim yeni adımızı geri yazıyor: orijinal korunur, metin
     // olduğu gibi kalır (Review Focus 5).
-    std::wstring recorded = L"S25+";
+    std::wstring recorded = L"MyPhone";
     NameUpdate u = ResolveIncomingText(SampleRules(), SampleMatch(), &recorded,
                                        L"Phone");
-    CHECK(u.original == L"S25+");
+    CHECK(u.original == L"MyPhone");
     CHECK(u.display == L"Phone");
 
     // Explorer orijinali yeniden yazıyor: yine yeni ad gösterilir.
-    u = ResolveIncomingText(SampleRules(), SampleMatch(), &recorded, L"S25+");
-    CHECK(u.original == L"S25+");
+    u = ResolveIncomingText(SampleRules(), SampleMatch(), &recorded, L"MyPhone");
+    CHECK(u.original == L"MyPhone");
     CHECK(u.display == L"Phone");
 }
 
 static void test_incoming_text_real_change() {
     // Öğenin gerçek adı değişti (ör. telefon yeniden adlandırıldı): yeni metin
     // orijinal olur ve artık kuralla eşleşmediği için olduğu gibi gösterilir.
-    std::wstring recorded = L"S25+";
+    std::wstring recorded = L"MyPhone";
     NameUpdate u = ResolveIncomingText(SampleRules(), SampleMatch(), &recorded,
                                        L"Pixel");
     CHECK(u.original == L"Pixel");
@@ -198,7 +198,7 @@ static void test_incoming_text_real_change() {
 }
 
 static void test_has_unresolved_clsid() {
-    // Varsayılan örnekte CLSID kuralı "S25+" adına çözülmüş.
+    // Varsayılan örnekte CLSID kuralı "MyPhone" adına çözülmüş.
     CHECK(!HasUnresolvedClsid(SampleRules(), SampleMatch()));
     auto match = SampleMatch();
     match[1] = L"";

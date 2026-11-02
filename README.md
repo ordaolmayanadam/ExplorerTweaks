@@ -9,7 +9,7 @@ Windows 11 File Explorer'ı sadeleştiren, tek başına çalışan bir [Windhawk
 - **Pin ikonlarını kaldırır.** Quick Access'teki pinli öğelerin yanındaki pin simgesi görünmez. Ayar kapatılınca ikonlar açık pencerelerde de hemen geri gelir.
 - **Sol menüyü (navigation pane) düzenler:**
   - **Sıralama:** `navItems` listesindeki sıra, menüdeki sırayı belirler. Listede olmayan öğeler listedekilerden sonra, kendi sıralarıyla gelir.
-  - **Yeniden adlandırma:** `newName` boş değilse öğe bu adla gösterilir (ör. "Ömer Fatih adlı kişiye ait S25+" yerine "Phone").
+  - **Yeniden adlandırma:** `newName` boş değilse öğe bu adla gösterilir (ör. "Ayşe adlı kişiye ait Telefon" yerine "Phone").
   - **Gizleme:** `hidden: true` olan öğeler menüden kaldırılır.
   - **Pinli klasörlerin yeri:** en üstte, en altta ya da Windows varsayılanı.
 

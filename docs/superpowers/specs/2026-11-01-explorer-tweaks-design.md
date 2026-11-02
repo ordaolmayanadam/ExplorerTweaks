@@ -18,7 +18,7 @@ Hedef sol menü düzeni (varsayılan ayarlar):
 
 ```
 This PC
-Phone            (asıl adı: "Ömer Fatih adlı kişiye ait S25+")
+Phone            (asıl adı: "Ayşe adlı kişiye ait Telefon")
 Linux
 <pinli Quick Access klasörleri, düz liste>
 ```
@@ -38,7 +38,7 @@ Explorer'ın sol menüsü `SysTreeView32` üzerinde çalışan bir `CNscTree`'di
 ```
 (gizli kök: Desktop)
 ├─ Downloads, Documents, Pictures, Music, Videos, Recycle Bin, Google Drive (G:)   state image = 1 (pin)
-├─ Ömer Fatih adlı kişiye ait S25+                                                state image = 0
+├─ Ayşe adlı kişiye ait Telefon                                                state image = 0
 ├─ This PC                                                                        state image = 0
 └─ Linux                                                                          state image = 0
 ```
