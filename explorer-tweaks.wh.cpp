@@ -483,21 +483,6 @@ inline bool IsThreadRecordStale(bool opened,
     return !opened || !stillActive || created != recorded;
 }
 
-// Bekleyen diagnostics bırakmaları için boşaltma zamanlayıcısı şimdi kurulmalı
-// mı? Kuyruk boş değilse, zamanlayıcı zaten kurulu değilse ve son kuyruğa
-// eklemeden bu yana quietMs geçtiyse (bildirim dalgası bittiyse). Saat geride
-// görünürse beklenir.
-inline bool ShouldArmDiagnosticsDrain(bool pendingEmpty,
-                                      bool armed,
-                                      unsigned long long now,
-                                      unsigned long long lastQueued,
-                                      unsigned long long quietMs) {
-    if (pendingEmpty || armed || now < lastQueued) {
-        return false;
-    }
-    return now - lastQueued >= quietMs;
-}
-
 // Sıralar ve tekrarları atar (bir üst eleman her çocuğu için bir kez kuyruğa
 // girer).
 template <typename T>
@@ -523,6 +508,8 @@ void SortUnique(std::vector<T>& values) {
 #undef GetCurrentTime
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Microsoft.UI.h>
+#include <winrt/Microsoft.UI.Content.h>
 #include <winrt/Microsoft.UI.Dispatching.h>
 #include <winrt/Microsoft.UI.Xaml.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
@@ -530,6 +517,7 @@ void SortUnique(std::vector<T>& values) {
 #include <winrt/Microsoft.UI.Xaml.Media.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -541,6 +529,30 @@ void SortUnique(std::vector<T>& values) {
 // Wh_ModBeforeUninit'te true olur. Bundan sonra kancalar hiçbir şey eklemez ve
 // davranışı değiştirmez (doğrudan orijinale geçer), yeni XAML işi başlamaz.
 std::atomic<bool> g_unloading{false};
+
+// Boşaltmadan sonra mod koduna hâlâ ulaşılabilecekse (bitmeyen yardımcı
+// thread, süren XAML geri çağrısı, ulaşılamayan XAML thread'i, kendi
+// thread'inde ayrılamayan ağaç) DLL süreç ömrü boyunca yüklü tutulur: Windhawk
+// modu kapatır ama kod bellekten kalkmaz, geride kalan geri çağrılar çökmeye
+// yol açmaz. Mod yeniden açılırsa aynı görüntü yüklenir; bu yüzden süreç
+// başına durum Wh_ModInit'te sıfırlanır.
+std::atomic<bool> g_modulePinned{false};
+
+void PinModule(const wchar_t* reason) {
+    Wh_Log(L"%s; keeping the mod loaded for the life of the process", reason);
+    if (g_modulePinned.exchange(true)) {
+        return;
+    }
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN |
+                                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                            reinterpret_cast<LPCWSTR>(&PinModule), &module)) {
+        Wh_Log(L"PinModule: GetModuleHandleExW failed (%u); unloading is "
+               L"unsafe",
+               GetLastError());
+        g_modulePinned.store(false);
+    }
+}
 
 // ===== Settings =====
 
@@ -1896,7 +1908,12 @@ void ForEachNavTree(void (*fn)(HWND)) {
 //   Bunun yerine satırın içi boşaltılır:
 //   TabView > ... > Primitives.TabViewListView#TabListView → Collapsed ve
 //   TabView.IsAddTabButtonVisible = false (AddButton). Satır boş bir title bar
-//   şeridi olarak kalır.
+//   şeridi olarak kalır. Boşalan TabView'ın Auto satırı küçülüp adres satırını
+//   caption düğmelerinin altına çekmesin diye TabView'a title bar iskele
+//   penceresinin yüksekliği (DIP) MinHeight olarak verilir (RT2).
+// - Toolbar'ın boşluğunu geri alan island yükseklik kancası yalnızca bir
+//   CommandBarControl gerçekten gizlendiyse (g_commandBarCollapsed) ölçekler:
+//   XAML başarısız olursa toolbar kırpılmaz.
 // Yalnızca bir FileExplorerExtensions.* atası olan TabView'lara dokunulur.
 
 namespace wux = winrt::Microsoft::UI::Xaml;
@@ -1927,7 +1944,25 @@ struct XamlChange {
 struct XamlTarget {
     winrt::weak_ref<wux::FrameworkElement> element;
     XamlKind kind;
+    // TabView: tablar gizlenmeden önce ölçülen satır yüksekliği (DIP), title
+    // bar yüksekliği bulunamazsa MinHeight için yedek; bilinmiyorsa 0.
+    double rowHeight = 0;
 };
+
+// Bir CommandBarControl şu anda gizli mi? Island yükseklik kancası yalnızca
+// o zaman ölçekler (spec §5: XAML başarısız olursa toolbar kırpılmamalı).
+std::atomic<bool> g_commandBarCollapsed{false};
+
+void NudgeExplorerLayouts();
+
+void SetCommandBarCollapsed(bool collapsed) {
+    if (!collapsed) {
+        g_commandBarCollapsed.store(false);
+    } else if (!g_commandBarCollapsed.exchange(true)) {
+        // Kanca artık ölçekliyor; açık pencereler yeniden ölçsün.
+        NudgeExplorerLayouts();
+    }
+}
 
 // İzlenen adaylar ve yaptığımız değişiklikler. XAML'e dokunulurken (SetValue
 // yeniden girişe yol açabilir) thread durumundan alınır (TakeTracking),
@@ -1944,12 +1979,15 @@ struct XamlTracking {
 // Harita yapısı g_collapsedMutex ile korunur.
 struct XamlThreadState {
     unsigned long long created = 0;  // thread'in oluşturulma zamanı (FILETIME)
+    // Kaydın oluşturulduğu mod oturumu (g_xamlGeneration). Sabitlenmiş bir
+    // DLL yeniden açılınca önceki oturumdan sızdırılmış kayıtlar yok sayılır.
+    unsigned generation = 0;
     XamlTracking tracking;
     // XAML Diagnostics'in bildirdiği elemanlara tuttuğu referansların bırakılma
     // kuyruğu (bkz. QueueDiagnosticsRelease).
     std::vector<InstanceHandle> pendingRelease;
-    unsigned long long lastQueued = 0;
-    bool drainArmed = false;
+    // Bu thread'de dispatcher yok: bırakma yapılamaz, kuyruğa alınmaz.
+    bool releaseUnavailable = false;
     winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer drainTimer{nullptr};
     winrt::event_token drainToken{};
 };
@@ -1961,6 +1999,8 @@ std::unordered_map<DWORD, std::unique_ptr<XamlThreadState>> g_collapsed;
 // Bu thread'in g_collapsed'daki durumu (önbellek). Yalnızca sahibi thread
 // kendi kaydını siler ve bunu sıfırlar.
 thread_local XamlThreadState* t_xamlState = nullptr;
+// Her Wh_ModInit'te artar (bkz. XamlThreadState::generation).
+std::atomic<unsigned> g_xamlGeneration{0};
 
 // Wh_ModUninit'te true olur: OnVisualTreeChange ve boşaltma zamanlayıcısı
 // hiçbir şey yapmaz.
@@ -2032,11 +2072,18 @@ void PruneStaleXamlThreadsLocked() {
 // Bu thread'in durumu; yoksa create ise oluşturulur (ve bu arada sahibi çıkmış
 // kayıtlar düşürülür), değilse nullptr.
 XamlThreadState* CurrentXamlState(bool create) {
+    if (t_xamlState &&
+        t_xamlState->generation != g_xamlGeneration.load()) {
+        // Önceki oturumda ulaşılamadığı için sızdırılmış kayıt (bellek hâlâ
+        // geçerli); artık haritada değildir, yok sayılır.
+        t_xamlState = nullptr;
+    }
     if (t_xamlState || !create) {
         return t_xamlState;
     }
     auto state = std::make_unique<XamlThreadState>();
     state->created = CurrentThreadCreationTime();
+    state->generation = g_xamlGeneration.load();
     XamlThreadState* raw = state.get();
     std::lock_guard<std::mutex> lock(g_collapsedMutex);
     auto& slot = g_collapsed[GetCurrentThreadId()];
@@ -2170,12 +2217,109 @@ void SetCollapsed(XamlTracking& state,
     }
 }
 
+// WinAppSDK WindowId → HWND (Microsoft.UI.Interop.h'deki
+// GetWindowFromWindowId'in yaptığı gibi FrameworkUdk üzerinden). Bulunamazsa
+// nullptr.
+HWND WindowFromWindowId(winrt::Microsoft::UI::WindowId id) {
+    using GetWindowFromWindowId_t =
+        HRESULT(WINAPI*)(winrt::Microsoft::UI::WindowId, HWND*);
+    HMODULE udk = GetModuleHandleW(L"Microsoft.Internal.FrameworkUdk.dll");
+    auto fn = udk ? reinterpret_cast<GetWindowFromWindowId_t>(GetProcAddress(
+                        udk, "Windowing_GetWindowFromWindowId"))
+                  : nullptr;
+    HWND hwnd = nullptr;
+    if (!fn || FAILED(fn(id, &hwnd))) {
+        return nullptr;
+    }
+    return hwnd;
+}
+
+BOOL CALLBACK FindThreadCabinetProc(HWND hwnd, LPARAM lParam) {
+    if (HasClassName(hwnd, L"CabinetWClass")) {
+        *reinterpret_cast<HWND*>(lParam) = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// Elemanın Explorer penceresindeki title bar iskele penceresinin
+// (TITLE_BAR_SCAFFOLDING_WINDOW_CLASS: caption düğmeleri + sürükleme alanı)
+// yüksekliği, DIP cinsinden; bulunamazsa 0. Elemanın UI thread'inde çağrılır.
+double TitleBarHeightDips(const wux::FrameworkElement& el) {
+    HWND cabinet = nullptr;
+    double scale = 0;
+    try {
+        if (auto root = el.XamlRoot()) {
+            scale = root.RasterizationScale();
+            if (auto env = root.ContentIslandEnvironment()) {
+                if (HWND hwnd = WindowFromWindowId(env.AppWindowId())) {
+                    cabinet = GetAncestor(hwnd, GA_ROOT);
+                }
+            }
+        }
+    } catch (...) {
+        // XamlRoot henüz yok ya da arayüz desteklenmiyor: aşağıdaki yola düş.
+    }
+    if (!HasClassName(cabinet, L"CabinetWClass")) {
+        // Her Explorer penceresinin kendi UI thread'i vardır.
+        cabinet = nullptr;
+        EnumThreadWindows(GetCurrentThreadId(), FindThreadCabinetProc,
+                          reinterpret_cast<LPARAM>(&cabinet));
+    }
+    if (!cabinet) {
+        return 0;
+    }
+    if (scale <= 0) {
+        scale = GetDpiForWindow(cabinet) / 96.0;
+    }
+    HWND scaffold = FindWindowExW(cabinet, nullptr,
+                                  L"TITLE_BAR_SCAFFOLDING_WINDOW_CLASS", nullptr);
+    RECT rc;
+    if (!scaffold || scale <= 0 || !GetWindowRect(scaffold, &rc) ||
+        rc.bottom <= rc.top) {
+        return 0;
+    }
+    return std::ceil((rc.bottom - rc.top) / scale);
+}
+
+// Tablar gizliyken TabView'ın satırı title bar yüksekliğini korur (RT2):
+// içi boşalınca Auto satır küçülür ve adres satırı caption düğmelerinin altına
+// kayar. Yükseklik title bar iskele penceresinden, o yoksa tablar gizlenmeden
+// önce ölçülen satır yüksekliğinden alınır.
+void ApplyTabRowHeight(XamlTracking& state,
+                       XamlTarget& target,
+                       const wux::FrameworkElement& el,
+                       bool hideTabs) {
+    const auto& dp = wux::FrameworkElement::MinHeightProperty();
+    if (!hideTabs) {
+        RestoreLocal(state, el, dp);
+        return;
+    }
+    if (!FindChange(state, el, dp)) {
+        double measured = el.ActualHeight();
+        if (measured > 0) {
+            target.rowHeight = measured;
+        }
+    }
+    double height = TitleBarHeightDips(el);
+    if (height <= 0) {
+        height = target.rowHeight;
+    }
+    if (height <= 0) {
+        // Bir sonraki TabListView bildiriminde (ya da ayar değişince) yeniden
+        // denenir.
+        Wh_Log(L"XAML: tab row height not known yet");
+        return;
+    }
+    SetLocal(state, el, dp, winrt::box_value(height));
+}
+
 // Elemanı geçerli ayarlara getirir (gizler ya da geri alır).
 void ApplyXamlTarget(XamlTracking& state,
+                     XamlTarget& target,
                      const wux::FrameworkElement& el,
-                     XamlKind kind,
                      const Settings& s) {
-    switch (kind) {
+    switch (target.kind) {
         case XamlKind::TabList:
             SetCollapsed(state, el, s.hideTabs);
             break;
@@ -2187,10 +2331,12 @@ void ApplyXamlTarget(XamlTracking& state,
             } else {
                 RestoreLocal(state, el, dp);
             }
+            ApplyTabRowHeight(state, target, el, s.hideTabs);
             break;
         }
         case XamlKind::CommandBar:
             SetCollapsed(state, el, s.hideCommandBar);
+            SetCommandBarCollapsed(s.hideCommandBar);
             break;
         case XamlKind::NavigationBar: {
             const auto& rowSpan = wux::Controls::Grid::RowSpanProperty();
@@ -2265,13 +2411,35 @@ void OnXamlTargetAdded(const wux::FrameworkElement& el, XamlKind kind) {
     if (tracking.targets.size() >= 32) {
         PruneDeadXaml(tracking);
     }
+    auto config = GetConfig();
     tracking.targets.push_back({winrt::make_weak(el), kind});
     try {
-        ApplyXamlTarget(tracking, el, kind, GetConfig()->settings);
+        ApplyXamlTarget(tracking, tracking.targets.back(), el,
+                        config->settings);
     } catch (...) {
         Wh_Log(L"XAML: applying to %s failed (0x%08X)",
                winrt::get_class_name(el).c_str(),
                static_cast<unsigned>(winrt::to_hresult()));
+    }
+    if (kind == XamlKind::TabList) {
+        // TabView kendisinden önce bildirilir; o anda XamlRoot ya da title bar
+        // penceresi henüz yoksa satır yüksekliği şimdi yeniden denenir.
+        for (XamlTarget& target : tracking.targets) {
+            if (target.kind != XamlKind::TabView) {
+                continue;
+            }
+            auto tabView = target.element.get();
+            if (!tabView) {
+                continue;
+            }
+            try {
+                ApplyTabRowHeight(tracking, target, tabView,
+                                  config->settings.hideTabs);
+            } catch (...) {
+                Wh_Log(L"XAML: tab row height failed (0x%08X)",
+                       static_cast<unsigned>(winrt::to_hresult()));
+            }
+        }
     }
     Wh_Log(L"XAML: tracking %s (thread %u)", winrt::get_class_name(el).c_str(),
            GetCurrentThreadId());
@@ -2284,13 +2452,13 @@ void ReapplyXamlForCurrentThread() {
     XamlTracking tracking = TakeTracking();
     PruneDeadXaml(tracking);
     auto config = GetConfig();
-    for (const XamlTarget& target : tracking.targets) {
+    for (XamlTarget& target : tracking.targets) {
         auto el = target.element.get();
         if (!el) {
             continue;
         }
         try {
-            ApplyXamlTarget(tracking, el, target.kind, config->settings);
+            ApplyXamlTarget(tracking, target, el, config->settings);
         } catch (...) {
             Wh_Log(L"XAML: reapply failed (0x%08X)",
                    static_cast<unsigned>(winrt::to_hresult()));
@@ -2313,12 +2481,12 @@ void ReapplyXamlForCurrentThread() {
 //
 // Bildirimler XAML'in kendi Enter/Leave yürüyüşlerinin içinden gelir; orada
 // referans bırakmak, yürüyüşün hâlâ ziyaret ettiği bir elemanı yok edebilir.
-// Bu yüzden kuyruk, bildirim dalgası durulduktan sonra (kDiagnosticsQuietMs)
-// thread'in dispatcher'ındaki tek atımlık bir zamanlayıcıyla boşaltılır.
-// Zamanlayıcı, kuyruğa yeni bir bildirim gelince kurulur (sürekli çalışan bir
-// zamanlayıcı yoktur); sessizleşen bir thread son dalgasını bir sonraki
-// bildirime kadar tutar. Dispatcher öğesi yerine zamanlayıcı kullanılır, çünkü
-// mod kaldırılırken durdurulabilir.
+// Bu yüzden kuyruk, bildirim dalgası durulduktan sonra thread'in
+// dispatcher'ındaki tek atımlık bir zamanlayıcıyla boşaltılır: her kuyruğa
+// eklemede zamanlayıcı kDiagnosticsQuietMs ile yeniden başlatılır (debounce),
+// son bildirimden kDiagnosticsQuietMs sonra Tick kuyruğu boşaltır. Böylece
+// sessizleşen bir thread'in son dalgası da bırakılır. Dispatcher öğesi yerine
+// zamanlayıcı kullanılır, çünkü mod kaldırılırken durdurulabilir.
 
 // XamlDiagnostics bu arayüzü de uygular; xamlom.h bildirmez.
 static constexpr GUID IID_IXamlDiagnosticsTestHooks = {
@@ -2336,28 +2504,18 @@ struct IXamlDiagnosticsTestHooks : IUnknown {
 };
 
 // Bir ağaç kurulurken gelen bildirim dalgasını beklemeye yetecek kadar.
-constexpr unsigned long long kDiagnosticsQuietMs = 200;
-// Boşaltmayı yalnızca onu kuran bildirimin dışına taşımak için.
-constexpr auto kDiagnosticsDrainDelay = std::chrono::milliseconds{1};
+constexpr auto kDiagnosticsQuietMs = std::chrono::milliseconds{200};
 
 void DrainDiagnosticsReleases();
 
+// Elemanı bırakma kuyruğuna alır ve boşaltma zamanlayıcısını yeniden başlatır
+// (son bildirimden kDiagnosticsQuietMs sonra boşaltılır). Bildirimin içinden
+// (elemanın UI thread'inde) çağrılır.
 void QueueDiagnosticsRelease(XamlThreadState& state, InstanceHandle handle) {
-    if (!handle) {
+    if (!handle || state.releaseUnavailable) {
         return;
     }
     state.pendingRelease.push_back(handle);
-    state.lastQueued = GetTickCount64();
-}
-
-// Kuyruk doluysa ve dalga durulduysa tek atımlık boşaltma zamanlayıcısını
-// kurar. Bildirimin içinden (elemanın UI thread'inde) çağrılır.
-void FlushDiagnosticsReleasesIfQuiet(XamlThreadState& state) {
-    if (!ShouldArmDiagnosticsDrain(state.pendingRelease.empty(),
-                                   state.drainArmed, GetTickCount64(),
-                                   state.lastQueued, kDiagnosticsQuietMs)) {
-        return;
-    }
     try {
         if (!state.drainTimer) {
             auto queue = winrt::Microsoft::UI::Dispatching::DispatcherQueue::
@@ -2368,19 +2526,22 @@ void FlushDiagnosticsReleasesIfQuiet(XamlThreadState& state) {
                 Wh_Log(L"XAML: no dispatcher queue on thread %u; elements stay "
                        L"held",
                        GetCurrentThreadId());
+                state.releaseUnavailable = true;
                 state.pendingRelease.clear();
                 return;
             }
             state.drainTimer = queue.CreateTimer();
             state.drainTimer.IsRepeating(false);
-            state.drainTimer.Interval(kDiagnosticsDrainDelay);
+            state.drainTimer.Interval(kDiagnosticsQuietMs);
             state.drainToken = state.drainTimer.Tick(
                 [](const winrt::Microsoft::UI::Dispatching::
                        DispatcherQueueTimer&,
                    const WinRtInspectable&) { DrainDiagnosticsReleases(); });
         }
+        // Çalışan bir zamanlayıcıda Start süreyi baştan başlatır; Stop bunu
+        // açıkça garanti eder.
+        state.drainTimer.Stop();
         state.drainTimer.Start();
-        state.drainArmed = true;
     } catch (...) {
         Wh_Log(L"XAML: arming the release drain failed (0x%08X)",
                static_cast<unsigned>(winrt::to_hresult()));
@@ -2400,7 +2561,6 @@ void StopDiagnosticsReleases(XamlThreadState& state) {
         Wh_Log(L"XAML: stopping the release drain failed (0x%08X)",
                static_cast<unsigned>(winrt::to_hresult()));
     }
-    state.drainArmed = false;
     state.pendingRelease.clear();
 }
 
@@ -2521,17 +2681,22 @@ void ReapplyXaml() {
 // olmayan thread'de serbest bırakılmamalı ve DLL boşaltılırken statik yıkıcıda
 // kalmamalıdır.
 void RestoreXaml() {
+    g_commandBarCollapsed.store(false);
     RunOnXamlThreads(RestoreXamlForCurrentThread);
-    std::lock_guard<std::mutex> lock(g_collapsedMutex);
-    if (!g_collapsed.empty()) {
-        Wh_Log(L"XAML: %zu live UI thread(s) not restored; their elements "
-               L"keep the hidden state and a release timer may remain "
-               L"(unsafe after unload)",
-               g_collapsed.size());
+    size_t unreachable = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_collapsedMutex);
+        unreachable = g_collapsed.size();
         for (auto& entry : g_collapsed) {
             AbandonXamlState(std::move(entry.second));
         }
         g_collapsed.clear();
+    }
+    if (unreachable) {
+        // Bu thread'lerin elemanları gizli kalır ve boşaltma zamanlayıcılarının
+        // Tick işleyicisi mod koduna işaret etmeye devam eder.
+        Wh_Log(L"XAML: %zu live UI thread(s) not restored", unreachable);
+        PinModule(L"XAML: unreachable UI threads keep callbacks into the mod");
     }
 }
 
@@ -2594,10 +2759,9 @@ class VisualTreeWatcher
         }
         if (m_testHooks) {
             // Bu bildirimin elemanını (ve eklemede, nesnesi yeniden oluşan üst
-            // elemanı) diagnostics'e geri vermek üzere kuyruğa al. Kuyruk,
-            // önceki dalga durulduysa önce boşaltılmaya kurulur.
+            // elemanı) diagnostics'e geri vermek üzere kuyruğa al; dalga
+            // durulunca boşaltılır.
             if (XamlThreadState* state = CurrentXamlState(true)) {
-                FlushDiagnosticsReleasesIfQuiet(*state);
                 QueueDiagnosticsRelease(*state, element.Handle);
                 if (mutationType == Add) {
                     QueueDiagnosticsRelease(*state, relation.Parent);
@@ -2653,7 +2817,6 @@ void DrainDiagnosticsReleases() {
     if (!state) {
         return;
     }
-    state->drainArmed = false;
     std::vector<InstanceHandle> pending = std::exchange(state->pendingRelease, {});
     if (g_xamlStopping.load() || pending.empty()) {
         return;
@@ -2699,14 +2862,28 @@ void PruneFinishedWorkersLocked() {
     });
 }
 
-// Thread'i (askıda oluşturulmuş) kaydeder ve başlatır.
-void StartWorker(HANDLE thread) {
+// Yardımcı thread'i oluşturur, kaydeder ve başlatır. Durdurma (StopXaml)
+// başladıysa hiç oluşturmaz ve false döner: g_xamlStopping g_watcherMutex
+// altında yazılır ve burada aynı kilit altında okunur, böylece StopXaml'ın
+// beklediği listeye girmeyen bir thread mod kodunu çalıştıramaz.
+bool StartWorker(LPTHREAD_START_ROUTINE proc, void* param) {
+    HANDLE thread = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_watcherMutex);
+        if (g_xamlStopping.load()) {
+            return false;
+        }
+        thread = CreateThread(nullptr, 0, proc, param, CREATE_SUSPENDED,
+                              nullptr);
+        if (!thread) {
+            Wh_Log(L"XAML: CreateThread failed (%u)", GetLastError());
+            return false;
+        }
         PruneFinishedWorkersLocked();
         g_workerThreads.push_back(thread);
     }
     ResumeThread(thread);
+    return true;
 }
 
 DWORD WINAPI AdviseThreadProc(LPVOID param) {
@@ -2726,23 +2903,24 @@ DWORD WINAPI AdviseThreadProc(LPVOID param) {
 void StartWatcher(const winrt::com_ptr<IUnknown>& site) {
     auto watcher =
         winrt::make_self<VisualTreeWatcher>(site.as<IXamlDiagnostics>());
-    auto* param = new winrt::com_ptr<VisualTreeWatcher>(watcher);
-    HANDLE thread = CreateThread(nullptr, 0, AdviseThreadProc, param,
-                                 CREATE_SUSPENDED, nullptr);
-    if (!thread) {
-        Wh_Log(L"XAML: CreateThread failed (%u)", GetLastError());
-        delete param;
-        return;
-    }
+    winrt::com_ptr<VisualTreeWatcher> old;
     {
         std::lock_guard<std::mutex> lock(g_watcherMutex);
-        if (g_watcher) {
-            Wh_Log(L"XAML: replacing an existing watcher");
-            g_watcher->Unadvise();
+        if (g_xamlStopping.load()) {
+            return;
         }
-        g_watcher = watcher;
+        old = std::exchange(g_watcher, watcher);
     }
-    StartWorker(thread);
+    // Unadvise XAML Diagnostics'e çağrı yapar; kilit dışında.
+    if (old) {
+        Wh_Log(L"XAML: replacing an existing watcher");
+        old->Unadvise();
+    }
+    auto* param = new winrt::com_ptr<VisualTreeWatcher>(watcher);
+    if (!StartWorker(AdviseThreadProc, param)) {
+        // Durdurma başladı; g_watcher'ı StopXaml alır (Advise edilmemiş).
+        delete param;
+    }
 }
 
 class ExplorerTweaksTap
@@ -2755,14 +2933,17 @@ class ExplorerTweaksTap
         if (!m_site) {
             return S_OK;
         }
+        if (g_unloading.load() || g_xamlStopping.load()) {
+            // Mod kaldırılıyor: InitializeXamlDiagnosticsEx'in LoadLibrary
+            // referansı bırakılmaz; DLL bu TAP nesnesi yaşadıkça yüklü kalır
+            // (boşaltılmış koda geri çağrı yapılmaz).
+            return S_OK;
+        }
         if (!m_moduleRefReleased) {
             // InitializeXamlDiagnosticsEx bu DLL'i LoadLibrary ile bir kez daha
             // yükledi; o referans bırakılır ki Windhawk modu boşaltabilsin.
             m_moduleRefReleased = true;
             FreeLibrary(GetCurrentModuleHandle());
-        }
-        if (g_unloading.load() || g_xamlStopping.load()) {
-            return S_OK;
         }
         StartWatcher(m_site);
         return S_OK;
@@ -2944,26 +3125,28 @@ void RequestTapInjection() {
     if (!g_tapState.compare_exchange_strong(expected, kTapInjecting)) {
         return;
     }
-    HANDLE thread = CreateThread(nullptr, 0, InjectThreadProc, nullptr,
-                                 CREATE_SUSPENDED, nullptr);
-    if (!thread) {
-        Wh_Log(L"XAML: CreateThread failed (%u)", GetLastError());
+    if (!StartWorker(InjectThreadProc, nullptr)) {
         g_tapState.store(kTapIdle);
-        return;
     }
-    StartWorker(thread);
 }
 
 // Enjeksiyonu ve watcher'ı durdurur; bu DLL'in kodunu çalıştıran hiçbir
 // yardımcı thread ya da XAML geri çağrısı kalmayana kadar bekler (Wh_ModUninit).
 void StopXaml() {
-    g_xamlStopping.store(true);
+    {
+        // StartWorker/StartWatcher bu bayrağı aynı kilit altında okur: bundan
+        // sonra yeni yardımcı thread ya da watcher kurulmaz.
+        std::lock_guard<std::mutex> lock(g_watcherMutex);
+        g_xamlStopping.store(true);
+    }
     if (g_stopEvent) {
         SetEvent(g_stopEvent);
     }
 
-    // Yardımcı thread'ler (enjeksiyon, advise). Enjeksiyon SetSite'ı ve yeni bir
-    // advise thread'ini tetikleyebilir; liste boşalana kadar tekrarlanır.
+    // Yardımcı thread'ler (enjeksiyon, advise). Durdurmadan önce başlamış bir
+    // enjeksiyon SetSite'ı tetikleyebilir; o artık yeni thread başlatmaz, ama
+    // liste yine de boşalana kadar tekrarlanır.
+    bool workerHung = false;
     for (;;) {
         std::vector<HANDLE> threads;
         {
@@ -2975,11 +3158,14 @@ void StopXaml() {
         }
         for (HANDLE thread : threads) {
             if (WaitForSingleObject(thread, 10000) != WAIT_OBJECT_0) {
-                Wh_Log(L"XAML: worker thread did not finish; unloading is "
-                       L"unsafe");
+                Wh_Log(L"XAML: worker thread did not finish");
+                workerHung = true;
             }
             CloseHandle(thread);
         }
+    }
+    if (workerHung) {
+        PinModule(L"XAML: a worker thread is still running mod code");
     }
 
     winrt::com_ptr<VisualTreeWatcher> watcher;
@@ -3002,6 +3188,7 @@ void StopXaml() {
     if (g_xamlCallbacks.load() > 0) {
         Wh_Log(L"XAML: %d visual tree callback(s) still running",
                g_xamlCallbacks.load());
+        PinModule(L"XAML: visual tree callbacks are still in flight");
     }
     // Son referans: XAML Diagnostics kendi referansını Unadvise'da bıraktı.
     watcher = nullptr;
@@ -3082,9 +3269,10 @@ HRESULT CNscTree_SetStateImageList_Hook(void* pThis, HIMAGELIST himl) {
 
 // XamlIslandViewAdapter::get_DesiredSizeInPhysicalPixels
 // (Windows.UI.FileExplorer.dll): Explorer XAML island'ının yüksekliğini buradan
-// alır; island içeriğin boyuna göre küçülmez. Toolbar gizliyken yükseklik
-// Styler'ın NoCommandBar değerine (136'da 87) ölçeklenir, böylece toolbar'ın
-// yeri boş bir şerit olarak kalmaz.
+// alır; island içeriğin boyuna göre küçülmez. Toolbar gerçekten gizlendiyse
+// (g_commandBarCollapsed) yükseklik Styler'ın NoCommandBar değerine (136'da
+// 87) ölçeklenir, böylece toolbar'ın yeri boş bir şerit olarak kalmaz. XAML
+// enjeksiyonu başarısızsa ölçeklenmez; toolbar kırpılmaz.
 using XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_t =
     HRESULT (*)(void*, SIZE*);
 XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_t
@@ -3097,7 +3285,7 @@ HRESULT XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Hook(
         XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Original(pThis,
                                                                        size);
     if (SUCCEEDED(hr) && size && size->cy > 0 && !g_unloading.load() &&
-        GetConfig()->settings.hideCommandBar) {
+        g_commandBarCollapsed.load() && GetConfig()->settings.hideCommandBar) {
         size->cy =
             MulDiv(size->cy, kFrameHeightNoCommandBar, kFrameHeightDefault);
     }
@@ -3159,6 +3347,17 @@ void HookPinIcons() {
 // ===== Mod lifecycle =====
 
 BOOL Wh_ModInit() {
+    // Önceki bir kapatmada DLL sabitlendiyse (PinModule) bu aynı görüntüdür ve
+    // globaller önceki oturumun son değerlerini taşır; süreç başına bir kez
+    // kurulan durum sıfırlanır.
+    g_unloading.store(false);
+    g_xamlStopping.store(false);
+    g_xamlGeneration.fetch_add(1);
+    g_tapState.store(kTapIdle);
+    g_commandBarCollapsed.store(false);
+    g_hiddenUnresolved.store(false);
+    g_lastResolveAttempt.store(0);
+
     g_runMsg = RegisterWindowMessageW(L"ExplorerTweaks_Run");
     g_reapplyMsg = RegisterWindowMessageW(L"ExplorerTweaks_Reapply");
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -3186,11 +3385,10 @@ void Wh_ModAfterInit() {
     });
     // Açık Explorer penceresi varsa TAP hemen (XAML hazırsa) enjekte edilir;
     // yoksa ilk pencere oluşunca CreateWindowExW kancası tetikler.
+    // Island yükseklik kancası ancak bir toolbar gizlenince ölçekler; o anda
+    // (SetCommandBarCollapsed) pencereler yeniden ölçülür.
     if (ScanExplorerWindows() & 1) {
         RequestTapInjection();
-        if (GetConfig()->settings.hideCommandBar) {
-            NudgeExplorerLayouts();
-        }
     }
 }
 
@@ -3209,7 +3407,8 @@ void Wh_ModBeforeUninit() {
 // zamanlayıcı, XAML geri çağrısı ya da yardımcı thread kalmamalıdır.
 void Wh_ModUninit() {
     g_unloading.store(true);
-    bool hadCommandBarHidden = GetConfig()->settings.hideCommandBar;
+    bool hadCommandBarHidden = g_commandBarCollapsed.load() ||
+                               GetConfig()->settings.hideCommandBar;
 
     // 1. TAP/watcher: enjeksiyon ve advise thread'lerini bekle, Unadvise.
     StopXaml();
@@ -3248,11 +3447,14 @@ void Wh_ModUninit() {
             ReapplyNames(tree);
             DetachTree(tree);
         });
-        std::lock_guard<std::mutex> lock(g_treesMutex);
-        if (g_trees.count(tree)) {
-            Wh_Log(L"Uninit: tree %p could not be detached on its thread; its "
-                   L"subclass stays installed (unsafe after unload)",
-                   tree);
+        bool attached = false;
+        {
+            std::lock_guard<std::mutex> lock(g_treesMutex);
+            attached = g_trees.count(tree) != 0;
+        }
+        if (attached && IsWindow(tree)) {
+            Wh_Log(L"Uninit: tree %p could not be detached on its thread", tree);
+            PinModule(L"Uninit: a nav tree subclass stays installed");
         }
     }
 
