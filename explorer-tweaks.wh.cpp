@@ -41,6 +41,9 @@ modlara bağlı değildir.
   #E5E5E5) bir çizgi çizilir (`headerUnderline`; yalnızca açık temada). Mod
   etkinleştirilmeden önce açılmış pencerelerde görünmesi için pencereyi
   yeniden açmak gerekebilir.
+- **Dosya listesi ve status bar çizgileri.** Status bar'ın üstüne tam
+  genişlikte, dosya listesinin sağına son sütun hizasında aynı tipte ince
+  çizgiler çizilir (`contentBox`; yalnızca açık temada).
 
 ## Ayarlar
 
@@ -103,6 +106,9 @@ Lisans: GPL-3.0.
 - headerUnderline: true
   $name: Sütun başlığının altına çizgi ekle
   $description: Açık temada Ayrıntılar görünümündeki sütun başlıklarının altına, aralarındaki dikey çizgilerle aynı tipte ince bir çizgi çizer.
+- contentBox: true
+  $name: Dosya listesi ve status bar çizgileri
+  $description: Açık temada status bar'ın üstüne tam genişlikte ve dosya listesinin sağına (son sütun hizasında) başlık çizgileriyle aynı tipte ince çizgiler çizer.
 - navItems:
   - - match: "This PC"
     - newName: ""
@@ -648,6 +654,111 @@ inline RECT HeaderUnderlineRect(const RECT& rect) {
     return {rect.left, rect.bottom - 1, rect.right, rect.bottom};
 }
 
+// ----- Dosya listesi ve status bar çizgileri -----
+
+inline bool IsEmptyRectValue(const RECT& r) {
+    return r.right <= r.left || r.bottom <= r.top;
+}
+
+inline bool RectsIntersect(const RECT& a, const RECT& b) {
+    return !IsEmptyRectValue(a) && !IsEmptyRectValue(b) && a.left < b.right &&
+           b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+}
+
+// Status bar'ın üst kenarı (dış DirectUI penceresinin istemci koordinatları):
+// görünür CtrlNotifySink çocuklarının (nav pane, DefView) en alttaki kenarı.
+// Boş dikdörtgenler sayılmaz. Çocuklar pencerenin altına kadar iniyorsa
+// (status bar kapalı) ya da hiç çocuk yoksa nullopt.
+inline std::optional<int> StatusTopY(const std::vector<RECT>& childRects,
+                                     int clientBottom) {
+    std::optional<int> bottom;
+    for (const RECT& r : childRects) {
+        if (!IsEmptyRectValue(r) && (!bottom || r.bottom > *bottom)) {
+            bottom = r.bottom;
+        }
+    }
+    if (!bottom || *bottom <= 0 || *bottom >= clientBottom) {
+        return std::nullopt;
+    }
+    return bottom;
+}
+
+// Status bar'ın üstündeki tam genişlikte 1 piksellik çizgi.
+inline std::optional<RECT> StatusBorderRect(const std::vector<RECT>& childRects,
+                                            int clientWidth,
+                                            int clientHeight) {
+    std::optional<int> y = StatusTopY(childRects, clientHeight);
+    if (!y || clientWidth <= 0) {
+        return std::nullopt;
+    }
+    return RECT{0, *y, clientWidth, *y + 1};
+}
+
+// Dosya listesinin sağ kenarı: son sütun başlığının sağ kenarındaki ayraçla
+// aynı x'te (lastRight - 1), başlığın altından pencerenin altına kadar 1
+// piksellik dikey çizgi. Pencerenin dışına düşerse nullopt.
+inline std::optional<RECT> RightBorderRect(int lastRight,
+                                           int headerBottom,
+                                           int clientWidth,
+                                           int clientHeight) {
+    if (lastRight <= 0 || lastRight - 1 >= clientWidth) {
+        return std::nullopt;
+    }
+    int top = std::max(headerBottom, 0);
+    if (top >= clientHeight) {
+        return std::nullopt;
+    }
+    return RECT{lastRight - 1, top, lastRight, clientHeight};
+}
+
+// Dosya listesindeki sütun başlığı şeridi (istemci koordinatları): öğelerin
+// en üst/en alt kenarı ve son sütunun sağ kenarı.
+struct HeaderGeometry {
+    bool valid = false;
+    int top = 0;
+    int bottom = 0;
+    int right = 0;
+};
+
+// Bir boyamada çizilen başlık öğesini (istemci koordinatları) birleştirir.
+inline void AccumulateHeaderItem(HeaderGeometry& g, const RECT& item) {
+    if (IsEmptyRectValue(item)) {
+        return;
+    }
+    if (!g.valid) {
+        g = {true, item.top, item.bottom, item.right};
+        return;
+    }
+    g.top = std::min<int>(g.top, item.top);
+    g.bottom = std::max<int>(g.bottom, item.bottom);
+    g.right = std::max<int>(g.right, item.right);
+}
+
+// Bir boyamadan sonra saklanacak başlık geometrisi. stored: önceki değer;
+// drawn: bu boyamada çizilen öğelerin birleşimi; update: boyamanın güncelleme
+// dikdörtgeni (istemci koordinatları). DirectUI kısmi boyar (hover): yalnızca
+// bazı sütunlar çizildiyse son sütunun kenarı korunur. Güncelleme eski son
+// kenarı kapsadığı halde daha dar çizildiyse sütunlar daralmıştır. Başlık
+// şeridine değen bir boyamada hiç öğe çizilmediyse başlık yoktur (ör. başka
+// bir görünüme geçildi).
+inline HeaderGeometry NextHeaderGeometry(const HeaderGeometry& stored,
+                                         const HeaderGeometry& drawn,
+                                         const RECT& update) {
+    if (drawn.valid) {
+        if (!stored.valid || drawn.right >= stored.right) {
+            return drawn;
+        }
+        RECT edge{stored.right - 1, stored.top, stored.right, stored.bottom};
+        return RectsIntersect(edge, update) ? drawn : stored;
+    }
+    if (stored.valid &&
+        RectsIntersect(RECT{0, stored.top, stored.right, stored.bottom},
+                       update)) {
+        return {};
+    }
+    return stored;
+}
+
 // ===== End Logic =====
 
 #ifndef ET_LOGIC_ONLY
@@ -723,6 +834,7 @@ struct Settings {
     bool subtleDividers = true;
     bool softSelection = true;
     bool headerUnderline = true;
+    bool contentBox = true;
     std::vector<NavRule> navItems;
 };
 
@@ -759,6 +871,7 @@ Settings LoadSettings() {
     s.subtleDividers = Wh_GetIntSetting(L"subtleDividers") != 0;
     s.softSelection = Wh_GetIntSetting(L"softSelection") != 0;
     s.headerUnderline = Wh_GetIntSetting(L"headerUnderline") != 0;
+    s.contentBox = Wh_GetIntSetting(L"contentBox") != 0;
 
     PCWSTR pos = Wh_GetStringSetting(L"pinnedPosition");
     if (pos && wcscmp(pos, L"top") == 0) {
@@ -4049,6 +4162,353 @@ void HookHeaderThemes() {
     }
 }
 
+// ----- Dosya listesi ve status bar çizgileri -----
+// Explorer penceresinde CabinetWClass > ShellTabWindowClass >
+// DUIViewWndClassName > DirectUIHWND ("dış DirectUI") bulunur. Çocukları
+// CtrlNotifySink'lerdir: biri nav pane'i (NamespaceTreeControl), biri
+// SHELLDLL_DefView > DirectUIHWND'yi ("dosya listesi") taşır. Status bar dış
+// DirectUI'nin kendisinin çizdiği, bu çocukların altında kalan şerittir
+// (msctls_statusbar32 gizlidir).
+// DirectUI pencereyi oluşturduktan sonra kendi pencere yordamını kurar
+// (SetWindowLongPtr GWLP_WNDPROC) ve comctl32'nin subclass zincirini çağırmaz;
+// bir subclass WM_PAINT'i hiç görmez. Bu yüzden user32 BeginPaint/EndPaint
+// süreç genelinde kancalanır; başka pencereler için kancalar yalnızca sınıf
+// adına bakıp geçer:
+//   - BeginPaint (dosya listesi): orijinalden sonra pencere ve rcPaint bu
+//     thread'in boyama yığınına konur. DrawThemeBackground(Ex) kancaları
+//     kayıtlı "Header" tutamacıyla gelen HP_HEADERITEM çizimlerini en üstteki
+//     dosya listesi çerçevesine toplar.
+//   - EndPaint (iki pencere): orijinalden sonra çizgiler GetDCEx ile (istemci
+//     koordinatlarında) üstüne çizilir:
+//       * Dış DirectUI: CtrlNotifySink çocuklarının en alt kenarında tam
+//         genişlikte yatay çizgi (status bar'ın üst kenarı). Çocuklar
+//         pencerenin altına kadar iniyorsa (status bar kapalı) çizilmez.
+//       * Dosya listesi: son sütun başlığının sağ kenarı hizasında, başlığın
+//         altından pencerenin altına kadar dikey çizgi.
+// Pencere başına durum (başlık geometrisi, son çizilen çizgi) HWND anahtarlı,
+// kilitli bir haritada tutulur: boyama her pencerenin kendi UI thread'inde,
+// ayar değişikliği başka bir thread'de olur. WM_NCDESTROY görülmediği için
+// ölü pencerelerin kayıtları yeni bir pencere eklenirken (IsWindow) silinir.
+
+constexpr COLORREF kContentBoxColor = kHeaderUnderlineColor;
+
+enum class ContentKind { None, Outer, FileList };
+
+struct ContentBoxState {
+    ContentKind kind = ContentKind::None;
+    // Yalnızca FileList: son bilinen başlık geometrisi (istemci koord.).
+    HeaderGeometry header;
+    // Son çizilen çizgi; yeri değişince eski şerit yeniden boyatılır.
+    bool hasDrawn = false;
+    RECT drawn{};
+};
+
+std::mutex g_contentBoxMutex;
+std::unordered_map<HWND, ContentBoxState> g_contentBoxes;
+
+// Bu thread'de süren BeginPaint/EndPaint çiftleri (iç içe boyamalar için
+// yığın). Dosya listesi boyanırken başka bir pencere boyanırsa o pencere için
+// yakalama yapmayan bir çerçeve eklenir; böylece başlık öğeleri yalnızca dosya
+// listesinin kendi boyamasından toplanır.
+struct PaintFrame {
+    HWND hwnd = nullptr;
+    bool fileList = false;
+    // BeginPaint'in rcPaint'i (istemci koord.). Bellek DC'sine çizilen başlık
+    // öğeleri, tamponun bu dikdörtgenin sol üst köşesinden başladığı
+    // varsayımıyla istemci koordinatlarına çevrilir.
+    RECT update{};
+    HeaderGeometry drawn;
+};
+
+constexpr int kMaxPaintDepth = 8;
+thread_local PaintFrame t_paintStack[kMaxPaintDepth];
+thread_local int t_paintDepth = 0;
+// Wh_ModInit'te artar: sabitlenmiş bir DLL yeniden başlatılınca önceki
+// oturumdan kalan çerçeveler (EndPaint'i kancasız işlenmiş) yok sayılır.
+std::atomic<unsigned> g_paintGeneration{0};
+thread_local unsigned t_paintGeneration = 0;
+
+void SyncPaintStack() {
+    unsigned generation = g_paintGeneration.load(std::memory_order_relaxed);
+    if (t_paintGeneration != generation) {
+        t_paintGeneration = generation;
+        t_paintDepth = 0;
+    }
+}
+
+void PushPaint(HWND hwnd, bool fileList, const RECT& update) {
+    SyncPaintStack();
+    if (t_paintDepth >= kMaxPaintDepth) {
+        // EndPaint'i gelmeyen çerçeveler birikti; yığın sıfırlanır.
+        t_paintDepth = 0;
+    }
+    PaintFrame& frame = t_paintStack[t_paintDepth++];
+    frame.hwnd = hwnd;
+    frame.fileList = fileList;
+    frame.update = update;
+    frame.drawn = {};
+}
+
+// hwnd'nin en üstteki çerçevesini (ve üstünde kalmış eşsiz çerçeveleri)
+// çıkarır.
+bool PopPaint(HWND hwnd, PaintFrame* out) {
+    SyncPaintStack();
+    for (int i = t_paintDepth - 1; i >= 0; --i) {
+        if (t_paintStack[i].hwnd == hwnd) {
+            *out = t_paintStack[i];
+            t_paintDepth = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Bu thread'de şu an boyanan dosya listesinin çerçevesi, yoksa nullptr.
+PaintFrame* CurrentFileListPaint() {
+    if (t_paintDepth <= 0 ||
+        t_paintGeneration != g_paintGeneration.load(std::memory_order_relaxed)) {
+        return nullptr;
+    }
+    PaintFrame* frame = &t_paintStack[t_paintDepth - 1];
+    return frame->fileList ? frame : nullptr;
+}
+
+ContentKind ContentKindOf(HWND hwnd) {
+    if (!HasClassName(hwnd, L"DirectUIHWND")) {
+        return ContentKind::None;
+    }
+    HWND parent = GetAncestor(hwnd, GA_PARENT);
+    if (HasClassName(parent, L"SHELLDLL_DefView")) {
+        return ContentKind::FileList;
+    }
+    if (HasClassName(parent, L"DUIViewWndClassName")) {
+        return ContentKind::Outer;
+    }
+    return ContentKind::None;
+}
+
+// g_contentBoxMutex tutulurken çağrılır. Kayıt yoksa (ya da tutamaç başka
+// türden bir pencereye yeniden verildiyse) sıfırdan oluşturulur; yeni kayıt
+// eklenmeden önce ölü pencerelerin kayıtları silinir.
+ContentBoxState& ContentBoxStateLocked(HWND hwnd, ContentKind kind) {
+    auto it = g_contentBoxes.find(hwnd);
+    if (it != g_contentBoxes.end() && it->second.kind == kind) {
+        return it->second;
+    }
+    if (it == g_contentBoxes.end()) {
+        for (auto i = g_contentBoxes.begin(); i != g_contentBoxes.end();) {
+            if (!IsWindow(i->first)) {
+                i = g_contentBoxes.erase(i);
+            } else {
+                ++i;
+            }
+        }
+    }
+    ContentBoxState& state = g_contentBoxes[hwnd];
+    state = ContentBoxState{};
+    state.kind = kind;
+    return state;
+}
+
+// Dış DirectUI'nin görünür CtrlNotifySink çocuklarının dikdörtgenleri
+// (istemci koord.). Hiçbiri SHELLDLL_DefView taşımıyorsa (dosya listesi olmayan
+// bir DirectUI görünümü) boş döner.
+std::vector<RECT> StatusChildRects(HWND outer) {
+    std::vector<RECT> rects;
+    bool hasDefView = false;
+    for (HWND child = GetWindow(outer, GW_CHILD); child;
+         child = GetWindow(child, GW_HWNDNEXT)) {
+        if (!IsWindowVisible(child) || !HasClassName(child, L"CtrlNotifySink")) {
+            continue;
+        }
+        RECT r;
+        if (!GetWindowRect(child, &r)) {
+            continue;
+        }
+        MapWindowPoints(HWND_DESKTOP, outer, reinterpret_cast<POINT*>(&r), 2);
+        rects.push_back(r);
+        if (FindWindowExW(child, nullptr, L"SHELLDLL_DefView", nullptr)) {
+            hasDefView = true;
+        }
+    }
+    if (!hasDefView) {
+        rects.clear();
+    }
+    return rects;
+}
+
+// EndPaint'ten sonra (pencerenin thread'inde): dosya listesinin başlık
+// geometrisini bu boyamanın çerçevesiyle (frame, olabilir nullptr) günceller
+// ve pencerenin çizgisini (tema açıksa) orijinal boyamanın üstüne çizer. Önceki
+// çizgi başka yerdeyse o şerit yeniden boyatılır. Ayarın açık olduğu
+// çağırandan bilinir.
+void DrawContentBox(HWND hwnd, ContentKind kind, const PaintFrame* frame) {
+    RECT client;
+    if (!GetClientRect(hwnd, &client)) {
+        return;
+    }
+    bool light = IsLightTheme();
+    std::vector<RECT> childRects;
+    if (light && kind == ContentKind::Outer) {
+        childRects = StatusChildRects(hwnd);
+    }
+
+    std::optional<RECT> line;
+    std::optional<RECT> stale;
+    HeaderGeometry header;
+    {
+        std::lock_guard<std::mutex> lock(g_contentBoxMutex);
+        ContentBoxState& state = ContentBoxStateLocked(hwnd, kind);
+        if (kind == ContentKind::FileList && frame) {
+            state.header =
+                NextHeaderGeometry(state.header, frame->drawn, frame->update);
+        }
+        header = state.header;
+        if (light) {
+            if (kind == ContentKind::Outer) {
+                line = StatusBorderRect(childRects, client.right, client.bottom);
+            } else if (header.valid) {
+                line = RightBorderRect(header.right, header.bottom,
+                                       client.right, client.bottom);
+            }
+        }
+        if (state.hasDrawn && (!line || !EqualRect(&state.drawn, &*line))) {
+            stale = state.drawn;
+        }
+        state.hasDrawn = line.has_value();
+        state.drawn = line ? *line : RECT{};
+    }
+
+    if (line) {
+        if (HDC dc = GetDCEx(hwnd, nullptr,
+                             DCX_CACHE | DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN)) {
+            if (HBRUSH brush = CreateSolidBrush(kContentBoxColor)) {
+                FillRect(dc, &*line, brush);
+                DeleteObject(brush);
+            }
+            ReleaseDC(hwnd, dc);
+        }
+    }
+    if (stale) {
+        InvalidateRect(hwnd, &*stale, FALSE);
+    }
+}
+
+// Kayıtlı bir "Header" tutamacıyla dosya listesi boyanırken gelen
+// HP_HEADERITEM çizimini (orijinalden sonra) başlık geometrisine ekler.
+// Dikdörtgen DC'nin mantıksal koordinatlarındadır: önce aygıt koordinatlarına
+// çevrilir. DC dosya listesinin kendisininse bunlar istemci koordinatlarıdır;
+// başka bir pencereninse o pencereden eşlenir; bellek DC'siyse (DirectUI
+// tamponu) tamponun BeginPaint'in rcPaint'inin sol üst köşesinden başladığı
+// varsayılır.
+void CaptureHeaderItem(HTHEME theme, HDC hdc, int partId, const RECT* rect) {
+    if (partId != kHpHeaderItem || !hdc || !rect || g_unloading.load()) {
+        return;
+    }
+    PaintFrame* paint = CurrentFileListPaint();
+    if (!paint || !IsHeaderTheme(theme) || !GetConfig()->settings.contentBox) {
+        return;
+    }
+    POINT pts[2] = {{rect->left, rect->top}, {rect->right, rect->bottom}};
+    if (!LPtoDP(hdc, pts, 2)) {
+        return;
+    }
+    POINT origin{paint->update.left, paint->update.top};
+    HWND dcWindow = WindowFromDC(hdc);
+    if (dcWindow == paint->hwnd) {
+        // İstemci koordinatları zaten.
+    } else if (dcWindow) {
+        MapWindowPoints(dcWindow, paint->hwnd, pts, 2);
+    } else {
+        for (POINT& pt : pts) {
+            pt.x += origin.x;
+            pt.y += origin.y;
+        }
+    }
+    RECT client{std::min(pts[0].x, pts[1].x), std::min(pts[0].y, pts[1].y),
+                std::max(pts[0].x, pts[1].x), std::max(pts[0].y, pts[1].y)};
+    AccumulateHeaderItem(paint->drawn, client);
+}
+
+using BeginPaint_t = decltype(&BeginPaint);
+BeginPaint_t BeginPaint_Original;
+
+HDC WINAPI BeginPaint_Hook(HWND hwnd, LPPAINTSTRUCT ps) {
+    HDC hdc = BeginPaint_Original(hwnd, ps);
+    if (!hdc || !ps || g_unloading.load()) {
+        return hdc;
+    }
+    ContentKind kind = ContentKindOf(hwnd);
+    if (kind == ContentKind::FileList) {
+        if (GetConfig()->settings.contentBox) {
+            PushPaint(hwnd, true, ps->rcPaint);
+        }
+        return hdc;
+    }
+    // Bir boyamanın içinde başka bir pencere boyanıyor: yakalama yapmayan bir
+    // çerçeve eklenir (EndPaint'te çıkarılır).
+    SyncPaintStack();
+    if (t_paintDepth > 0) {
+        PushPaint(hwnd, false, ps->rcPaint);
+    }
+    return hdc;
+}
+
+using EndPaint_t = decltype(&EndPaint);
+EndPaint_t EndPaint_Original;
+
+BOOL WINAPI EndPaint_Hook(HWND hwnd, const PAINTSTRUCT* ps) {
+    BOOL result = EndPaint_Original(hwnd, ps);
+    if (g_unloading.load()) {
+        return result;
+    }
+    PaintFrame frame;
+    bool hasFrame = t_paintDepth > 0 && PopPaint(hwnd, &frame);
+    ContentKind kind = hasFrame && frame.fileList ? ContentKind::FileList
+                                                  : ContentKindOf(hwnd);
+    if (kind == ContentKind::None) {
+        return result;
+    }
+    if (!GetConfig()->settings.contentBox) {
+        return result;
+    }
+    DrawContentBox(hwnd, kind, hasFrame && frame.fileList ? &frame : nullptr);
+    return result;
+}
+
+void HookContentBox() {
+    {
+        std::lock_guard<std::mutex> lock(g_contentBoxMutex);
+        g_contentBoxes.clear();
+    }
+    g_paintGeneration.fetch_add(1);
+    if (!WindhawkUtils::SetFunctionHook(BeginPaint, BeginPaint_Hook,
+                                        &BeginPaint_Original) ||
+        !WindhawkUtils::SetFunctionHook(EndPaint, EndPaint_Hook,
+                                        &EndPaint_Original)) {
+        Wh_Log(L"content box paint hooks unavailable");
+    }
+}
+
+// Çizgi çizilmiş DirectUI pencerelerini yeniden boyatır (InvalidateRect
+// thread'ler arası güvenlidir); tam yeniden boyama eski çizgileri sildiği için
+// kayıtlar "çizilmedi" olarak işaretlenir.
+void InvalidateContentBoxes() {
+    std::vector<HWND> windows;
+    {
+        std::lock_guard<std::mutex> lock(g_contentBoxMutex);
+        for (auto& [hwnd, state] : g_contentBoxes) {
+            windows.push_back(hwnd);
+            state.hasDrawn = false;
+        }
+    }
+    for (HWND hwnd : windows) {
+        if (IsWindow(hwnd)) {
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+    }
+}
+
 using DrawThemeBackground_t = decltype(&DrawThemeBackground);DrawThemeBackground_t DrawThemeBackground_Original;
 
 HRESULT WINAPI DrawThemeBackground_Hook(HTHEME theme,
@@ -4064,6 +4524,7 @@ HRESULT WINAPI DrawThemeBackground_Hook(HTHEME theme,
                                               clipRect);
     if (SUCCEEDED(hr)) {
         DrawHeaderUnderline(theme, hdc, partId, rect, clipRect);
+        CaptureHeaderItem(theme, hdc, partId, rect);
     }
     return hr;
 }
@@ -4088,6 +4549,7 @@ HRESULT WINAPI DrawThemeBackgroundEx_Hook(HTHEME theme,
                                                 rect, options);
     if (SUCCEEDED(hr)) {
         DrawHeaderUnderline(theme, hdc, partId, rect, clipRect);
+        CaptureHeaderItem(theme, hdc, partId, rect);
     }
     return hr;
 }
@@ -4203,6 +4665,7 @@ BOOL Wh_ModInit() {
     HookDividers();
     HookHeaderThemes();
     HookSoftSelection();
+    HookContentBox();
     return TRUE;
 }
 
@@ -4217,6 +4680,11 @@ void Wh_ModAfterInit() {
             ResortTree(tree);
         });
     });
+    // Dosya listesi ve status bar çizgileri: mevcut DirectUI pencereleri
+    // yeniden boyanır; çizgiler EndPaint kancasında çizilir.
+    if (GetConfig()->settings.contentBox) {
+        InvalidateFileLists();
+    }
     // Açık Explorer penceresi varsa TAP hemen (XAML hazırsa) enjekte edilir;
     // yoksa ilk pencere oluşunca CreateWindowExW kancası tetikler.
     // Island yükseklik kancası ancak bir toolbar gizlenince ölçekler; o anda
@@ -4237,7 +4705,7 @@ void Wh_ModBeforeUninit() {
 
 // Kancalar kaldırıldıktan sonra, DLL boşaltılmadan önce çağrılır. Sıra:
 // XAML watcher'ı durdur → XAML'i geri al → registry'yi geri yükle → ağaçları
-// ayır. Sonunda mod koduna işaret eden hiçbir subclass, kanca, geri çağrılı
+// ayır → DirectUI pencerelerini çizgisiz yeniden boya. Sonunda mod koduna işaret eden hiçbir subclass, kanca, geri çağrılı
 // zamanlayıcı, XAML geri çağrısı ya da yardımcı thread kalmamalıdır.
 void Wh_ModUninit() {
     g_unloading.store(true);
@@ -4255,6 +4723,7 @@ void Wh_ModUninit() {
         empty->settings.subtleDividers = false;
         empty->settings.softSelection = false;
         empty->settings.headerUnderline = false;
+        empty->settings.contentBox = false;
         empty->settings.pinnedPosition = PinnedPosition::Default;
         std::shared_ptr<const Config> old;
         std::lock_guard<std::mutex> lock(g_configMutex);
@@ -4302,6 +4771,15 @@ void Wh_ModUninit() {
             Wh_Log(L"Uninit: tree %p could not be detached on its thread", tree);
             PinModule(L"Uninit: a nav tree subclass stays installed");
         }
+    }
+
+    // 5. Dosya listesi ve status bar çizgileri: BeginPaint/EndPaint kancaları
+    // kalktı (subclass yok); çizgi çizilmiş pencereler çizgisiz yeniden
+    // boyanır (Explorer pencerelerindekiler InvalidateFileLists ile zaten).
+    InvalidateContentBoxes();
+    {
+        std::lock_guard<std::mutex> lock(g_contentBoxMutex);
+        g_contentBoxes.clear();
     }
 
     // Sabitlendiyse geride kalan kod bu tutamaçları hâlâ kullanabilir;
@@ -4357,6 +4835,7 @@ void Wh_ModSettingsChanged() {
     g_lightThemeCheckedAt.store(0);
     InvalidateNavTrees();
     InvalidateFileLists();
+    InvalidateContentBoxes();
 }
 
 #endif  // ET_LOGIC_ONLY

@@ -479,7 +479,112 @@ static void test_header_underline_rect() {
     CHECK(r.left == 10 && r.right == 210 && r.top == 71 && r.bottom == 72);
 }
 
+static bool RectIs(const RECT& r, int l, int t, int rt, int b) {
+    return r.left == l && r.top == t && r.right == rt && r.bottom == b;
+}
+
+static void test_status_top_y() {
+    // Nav pane ve DefView aynı y'de biter; altında status bar şeridi kalır.
+    CHECK(StatusTopY({{0, 0, 600, 1064}, {600, 0, 2252, 1064}}, 1114) ==
+          std::optional<int>(1064));
+    // Farklı yükseklikler: en alttaki kenar.
+    CHECK(StatusTopY({{0, 0, 600, 1000}, {600, 0, 2252, 1064}}, 1114) ==
+          std::optional<int>(1064));
+    // Status bar kapalı: çocuklar alt kenara kadar iner.
+    CHECK(!StatusTopY({{0, 0, 600, 1114}, {600, 0, 2252, 1114}}, 1114));
+    CHECK(!StatusTopY({{0, 0, 600, 1200}}, 1114));
+    // Çocuk yok ya da hepsi boş.
+    CHECK(!StatusTopY({}, 1114));
+    CHECK(!StatusTopY({{10, 10, 10, 500}, {0, 20, 300, 20}}, 1114));
+    // Boş dikdörtgenler sayılmaz.
+    CHECK(StatusTopY({{0, 0, 600, 1064}, {5, 1100, 5, 1110}}, 1114) ==
+          std::optional<int>(1064));
+    // Alt kenarı 0 ya da üstünde olan çocuk çizgi vermez.
+    CHECK(!StatusTopY({{0, -50, 600, 0}}, 1114));
+}
+
+static void test_status_border_rect() {
+    auto r = StatusBorderRect({{0, 0, 600, 1064}, {600, 0, 2252, 1064}}, 2252,
+                              1114);
+    CHECK(r && RectIs(*r, 0, 1064, 2252, 1065));
+    CHECK(!StatusBorderRect({{0, 0, 600, 1114}}, 2252, 1114));
+    CHECK(!StatusBorderRect({{0, 0, 600, 1064}}, 0, 1114));
+}
+
+static void test_right_border_rect() {
+    auto r = RightBorderRect(1200, 64, 1650, 1064);
+    CHECK(r && RectIs(*r, 1199, 64, 1200, 1064));
+    // Son sütun pencerenin sağ kenarına kadar: son piksel hâlâ içeride.
+    r = RightBorderRect(1650, 64, 1650, 1064);
+    CHECK(r && RectIs(*r, 1649, 64, 1650, 1064));
+    // Pencerenin dışında (yatay kaydırılmış ya da geniş sütunlar).
+    CHECK(!RightBorderRect(1651, 64, 1650, 1064));
+    CHECK(!RightBorderRect(0, 64, 1650, 1064));
+    CHECK(!RightBorderRect(-20, 64, 1650, 1064));
+    // Başlık alt kenarı pencerenin altında ya da üstünde.
+    CHECK(!RightBorderRect(1200, 1064, 1650, 1064));
+    r = RightBorderRect(1200, -5, 1650, 1064);
+    CHECK(r && RectIs(*r, 1199, 0, 1200, 1064));
+}
+
+static void test_header_geometry_accumulate() {
+    HeaderGeometry g;
+    CHECK(!g.valid);
+    AccumulateHeaderItem(g, {0, 0, 400, 64});
+    CHECK(g.valid && g.top == 0 && g.bottom == 64 && g.right == 400);
+    AccumulateHeaderItem(g, {400, 0, 900, 64});
+    AccumulateHeaderItem(g, {900, 2, 1200, 66});
+    CHECK(g.valid && g.top == 0 && g.bottom == 66 && g.right == 1200);
+    // Boş dikdörtgen sayılmaz.
+    HeaderGeometry e;
+    AccumulateHeaderItem(e, {10, 10, 10, 64});
+    CHECK(!e.valid);
+}
+
+static void test_next_header_geometry() {
+    HeaderGeometry stored{true, 0, 64, 1200};
+    HeaderGeometry none;
+    HeaderGeometry wider{true, 0, 64, 1300};
+    HeaderGeometry partial{true, 0, 64, 400};  // yalnızca ilk sütun boyandı
+
+    // İlk ölçüm.
+    HeaderGeometry g = NextHeaderGeometry(none, wider, {0, 0, 1650, 1064});
+    CHECK(g.valid && g.right == 1300);
+    // Daha geniş: her zaman alınır.
+    g = NextHeaderGeometry(stored, wider, {0, 0, 1650, 64});
+    CHECK(g.valid && g.right == 1300);
+    // Kısmi boyama (hover): son sütun boyanmadı, eski değer kalır.
+    g = NextHeaderGeometry(stored, partial, {0, 0, 400, 64});
+    CHECK(g.valid && g.right == 1200);
+    // Güncelleme eski son kenarı kapsıyor ama daha dar çizildi: sütun daraldı.
+    g = NextHeaderGeometry(stored, partial, {0, 0, 1650, 1064});
+    CHECK(g.valid && g.right == 400);
+    // Başlık şeridini kapsayan boyamada hiç başlık öğesi yok: başlık gitti
+    // (ör. Simgeler görünümüne geçildi).
+    g = NextHeaderGeometry(stored, none, {0, 0, 1650, 1064});
+    CHECK(!g.valid);
+    g = NextHeaderGeometry(stored, none, {500, 10, 600, 20});
+    CHECK(!g.valid);
+    // Başlık şeridine değmeyen boyama (dosya öğesi hover'ı, eski çizgi
+    // şeridi): korunur.
+    g = NextHeaderGeometry(stored, none, {0, 64, 1650, 1064});
+    CHECK(g.valid && g.right == 1200);
+    g = NextHeaderGeometry(stored, none, {1199, 64, 1200, 1064});
+    CHECK(g.valid && g.right == 1200);
+    // Son sütunun sağında kalan başlık şeridi: öğe çizilmez, korunur.
+    g = NextHeaderGeometry(stored, none, {1200, 0, 1650, 64});
+    CHECK(g.valid && g.right == 1200);
+    // Boş güncelleme: değişmez.
+    g = NextHeaderGeometry(stored, none, {0, 0, 0, 0});
+    CHECK(g.valid && g.right == 1200);
+}
+
 int main() {
+    test_status_top_y();
+    test_status_border_rect();
+    test_right_border_rect();
+    test_header_geometry_accumulate();
+    test_next_header_geometry();
     test_divider_color_override();
     test_soft_selection_color();
     test_soft_selection_metrics();

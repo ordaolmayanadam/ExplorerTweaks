@@ -15,6 +15,7 @@ Windows 11 File Explorer'ı sadeleştiren, tek başına çalışan bir [Windhawk
   - **Ayraçları sadeleştirme:** yatay ayraçlar, sağdaki dikey ayraçla aynı renkte (#F7F7F7) çizilir. Yalnızca açık temada etkilidir; koyu temada Windows'un rengi kalır. Kalınlık ve kenar boşlukları değişmez.
   - **Seçimi yumuşatma:** açık temada seçili ya da üzerine gelinen öğenin arka planı daha soluk, kenarlıksız, yuvarlak köşeli ve kenarlardan içeride çizilir. Koyu temada Windows'un çizimi kalır.
 - **Sütun başlığının altına çizgi ekler.** Ayrıntılar görünümünde sütun başlıklarının altına, aralarındaki dikey çizgilerle aynı tipte (1 piksel, #E5E5E5) bir çizgi çizilir; çizgi yalnızca başlık öğelerinin altındadır, son sütunun sağ kenarında biter. Yalnızca açık temada etkilidir. Mod etkinleştirilmeden önce açılmış pencerelerde görünmesi için pencereyi yeniden açmak gerekebilir.
+- **Dosya listesi ve status bar çizgileri.** Status bar'ın üstüne pencerenin tam genişliğinde, dosya listesinin sağına da son sütun başlığının sağ kenarı hizasında (başlığın altından status bar'a kadar) başlık çizgileriyle aynı tipte (1 piksel, #E5E5E5) çizgiler çizilir (`contentBox`). Yalnızca açık temada etkilidir. Status bar kapalıysa üst çizgi çizilmez; sağ çizgi için, mod etkinleştirilmeden önce açılmış pencereleri yeniden açmak gerekebilir.
 
 Her özellik Windhawk ayar ekranından ayrı ayrı açılıp kapatılabilir. Sıra, ad ve pin ikonu değişiklikleri açık pencerelere hemen uygulanır.
 
@@ -50,6 +51,7 @@ Varsayılan ayarlar:
 | `subtleDividers` | `true` | Sol menü ayraçlarını sadeleştir (yalnızca açık temada) |
 | `softSelection` | `true` | Sol menü seçimini yumuşat (yalnızca açık temada) |
 | `headerUnderline` | `true` | Sütun başlığının altına çizgi ekle (yalnızca açık temada) |
+| `contentBox` | `true` | Dosya listesi ve status bar çizgileri (yalnızca açık temada) |
 | `navItems` | aşağıya bakın | Sol menü öğeleri |
 
 Varsayılan `navItems` listesi:

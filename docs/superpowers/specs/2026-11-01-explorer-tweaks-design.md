@@ -66,7 +66,9 @@ Proje tek bir dosyadan oluşur: `explorer-tweaks.wh.cpp`. Hedef süreç `explore
 | Sol menü: sıra, ad, pinlilerin yeri | Nav pane ağacının subclass'ı | Anında |
 | Sol menü: ayraç rengi (yalnızca açık tema) | `CNscTree::DrawDivider` (ExplorerFrame.dll) sembol hook'u thread-local bayrak kurar; `CreatePen` hook'u bayrak varken kalem rengini #F7F7F7 (dikey ayraçla aynı) yapar. Koyu temada Windows rengi kalır; tema `AppsUseLightTheme` değerinden okunur (2 sn önbellek) | Anında |
 | Sol menü: seçim/hover vurgusu (yalnızca açık tema) | Nav ağacının WM_PAINT/WM_PRINTCLIENT işlenmesi sürerken thread-local ağaç tutamacı kurulur; uxtheme `DrawThemeBackground(Ex)` hook'u TVP_TREEITEM'in hover/seçili durumlarında (TREIS_HOT, SELECTED, SELECTEDNOTFOCUS, HOTSELECTED) kenarlıksız, yuvarlak köşeli, yatayda içeri girintili ve daha soluk bir dolgu çizer. Koyu temada ve ağaç dışı çağrılarda orijinale geçer | Anında |
-| Ayrıntılar görünümü: sütun başlığı alt çizgisi (yalnızca açık tema) | Dosya listesi DirectUI olduğundan SysHeader32 yoktur; başlık, \ `HKCU\Software\Classes\CLSID\{…}\System.IsPinnedToNameSpaceTree = 0`, yedekle ve geri yükle | Explorer yeniden açılınca |
+| Sol menü: gizleme | `HKCU\Software\Classes\CLSID\{…}\System.IsPinnedToNameSpaceTree = 0`, yedekle ve geri yükle | Explorer yeniden açılınca |
+| Ayrıntılar görünümü: sütun başlığı alt çizgisi (yalnızca açık tema) | Dosya listesi DirectUI olduğundan SysHeader32 yoktur; başlık öğeleri uxtheme "Header" sınıfıyla (HP_HEADERITEM) `DrawThemeBackground(Ex)`'e gelir. `OpenThemeData*` hook'ları "Header" tutamaçlarını kaydeder (`CloseThemeData`'da silinir); kayıtlı tutamaçla gelen HP_HEADERITEM çiziminden sonra öğenin alt kenarına 1 px #E5E5E5 çizgi çizilir | Yeni pencerelerde |
+| Dosya listesi ve status bar çizgileri (yalnızca açık tema) | Dış DirectUIHWND (ebeveyni `DUIViewWndClassName`) ve dosya listesi DirectUIHWND'si (ebeveyni `SHELLDLL_DefView`) subclass edilmez: DirectUI oluşturmadan sonra kendi pencere yordamını kurup comctl32 subclass zincirini atladığı için subclass WM_PAINT'i görmez. Bunun yerine user32 `BeginPaint`/`EndPaint` süreç genelinde kancalanır (diğer pencereler yalnızca sınıf adı kontrolüyle geçer). `BeginPaint` dosya listesinin `rcPaint`'ini thread'e özgü bir boyama yığınına koyar; `EndPaint` orijinalden sonra `GetDCEx` ile 1 px #E5E5E5 çizilir: dış pencerede görünür `CtrlNotifySink` çocuklarının en alt kenarında tam genişlikte yatay çizgi (status bar'ın üstü; çocuklar alta kadar iniyorsa çizilmez); dosya listesinde son sütun başlığının sağ kenarı hizasında (x = right − 1) başlığın altından pencerenin altına dikey çizgi. Başlık geometrisi, dosya listesi boyanırken kayıtlı "Header" tutamacıyla gelen HP_HEADERITEM dikdörtgenlerinden (LPtoDP; bellek DC'sinde `rcPaint` kökeni eklenerek) toplanır; kısmi boyamalarda son bilinen değer korunur. Pencere başına durum HWND anahtarlı, kilitli bir haritadadır; ölü pencereler `IsWindow` ile ayıklanır | Status bar çizgisi anında; sağ çizgi yeni pencerelerde |
 
 ### 3.1 Nav pane subclass
 
@@ -139,6 +141,9 @@ Proje tek bir dosyadan oluşur: `explorer-tweaks.wh.cpp`. Hedef süreç `explore
 - headerUnderline: true
   $name: Sütun başlığının altına çizgi ekle
   $description: Açık temada Ayrıntılar görünümündeki sütun başlıklarının altına, aralarındaki dikey çizgilerle aynı tipte ince bir çizgi çizer.
+- contentBox: true
+  $name: Dosya listesi ve status bar çizgileri
+  $description: Açık temada status bar'ın üstüne tam genişlikte ve dosya listesinin sağına (son sütun hizasında) başlık çizgileriyle aynı tipte ince çizgiler çizer.
 - navItems:
   - - match: "This PC"
     - newName: ""
